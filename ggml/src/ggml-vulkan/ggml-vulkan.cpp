@@ -1,3 +1,4 @@
+#include <chrono>
 #include "ggml-vulkan-common.h"
 
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
@@ -2871,12 +2872,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             rm_stdq = 2;
             rm_kq = 4;
             rm_stdq_int = 4;
+            rm_kq_int = 4;
         }
     } else if (device->vendor_id == VK_VENDOR_ID_INTEL) {
         rm_stdq = 2;
         rm_stdq_int = 2;
     }
-    // RDNA3/4: above four columns, static 4 rows for all types bench faster than the default
+    // engine-lab tuning overrides
+    if (const char * e = getenv("ENGINE_LAB_RM_STDQ_INT")) { rm_stdq_int = atoi(e); }
+    if (const char * e = getenv("ENGINE_LAB_RM_KQ_INT")) { rm_kq_int = atoi(e); }
+        // RDNA3/4: above four columns, static 4 rows for all types bench faster than the default
     const bool is_rdna3_or_4 = device->vendor_id == VK_VENDOR_ID_AMD && (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
     auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3_or_4 && i >= 4) ? 4u : rows; };
     // RDNA3/4 and NVIDIA except pre-Turing: use 4 rows for MUL_MAT_ID MMVQ.
@@ -5628,6 +5633,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         }
     }
 
+    if (const char * e = getenv("ENGINE_LAB_WG")) { dmmv_wg = atoi(e) ? DMMV_WG_SIZE_LARGE : DMMV_WG_SIZE_SUBGROUP; }
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
@@ -14279,7 +14285,20 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph);
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    static const bool lab_t = getenv("ENGINE_LAB_VKT") != nullptr;
+    if (!lab_t) return ggml_backend_vk_graph_compute_impl(backend, cgraph);
+    static double tot = 0; static long n = 0, nodes = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    auto r = ggml_backend_vk_graph_compute_impl(backend, cgraph);
+    if (cgraph->n_nodes < 400) {
+        tot += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(); n++; nodes += cgraph->n_nodes;
+        if (n % 4000 == 0) fprintf(stderr, "VKT: %ld small graphs, %.1f us/graph (cpu record+submit), %.1f nodes/graph, %.2f us/node\n", n, tot/n, (double)nodes/n, tot/nodes);
+    }
+    return r;
+}
+static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
@@ -14376,6 +14395,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    { static const char * lab_fs = getenv("ENGINE_LAB_FLOPS_DIV"); if (lab_fs) { int d = atoi(lab_fs); flops_per_submit = d == 0 ? 0 : std::min(flops_cap, ctx->last_total_flops / (uint64_t)d); } }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
