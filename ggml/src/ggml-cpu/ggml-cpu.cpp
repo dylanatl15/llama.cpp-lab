@@ -1,3 +1,4 @@
+#include <chrono>
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
@@ -187,6 +188,17 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
 
+    static const bool lab_t = getenv("ENGINE_LAB_CPUT") != nullptr;
+    if (lab_t) {
+        static double tot = 0; static long n = 0, nodes = 0; static long small_n = 0; static double small_t = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        auto r = ggml_graph_compute(cgraph, &cplan);
+        double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        tot += us; n++; nodes += cgraph->n_nodes;
+        if (cgraph->n_nodes <= 8) { small_n++; small_t += us; }
+        if (n % 2000 == 0) fprintf(stderr, "CPUT: %ld graphs, %.1f us/graph, %.1f nodes/graph; small(<=8 nodes) %ld avg %.1f us\n", n, tot/n, (double)nodes/n, small_n, small_n ? small_t/small_n : 0.0);
+        return r;
+    }
     return ggml_graph_compute(cgraph, &cplan);
 }
 

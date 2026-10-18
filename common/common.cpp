@@ -1708,6 +1708,29 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+
+// ---- engine-lab: MoE expert routing trace (env EXPERT_TRACE=<file>) ----
+#include <cstdio>
+#include <cstring>
+static bool engine_lab_expert_trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    static FILE * f = nullptr;
+    static std::vector<int32_t> buf;
+    (void) user_data;
+    if (strncmp(t->name, "ffn_moe_topk-", 13) != 0) { return false; }
+    if (ask) { return true; }
+    if (!f) { f = fopen(getenv("EXPERT_TRACE"), "ab"); if (!f) { return true; } }
+    const int layer = atoi(t->name + 13);
+    const int64_t n_used = t->ne[0], n_tok = t->ne[1];
+    buf.resize(n_used * n_tok);
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(int32_t));
+    // record: u16 layer, u16 n_tokens, u16 n_used, then n_tokens*n_used u16 expert ids
+    uint16_t h[3] = { (uint16_t) layer, (uint16_t) std::min<int64_t>(n_tok, 65535), (uint16_t) n_used };
+    fwrite(h, sizeof(h), 1, f);
+    for (size_t i = 0; i < buf.size(); i++) { uint16_t e = (uint16_t) buf[i]; fwrite(&e, 2, 1, f); }
+    static int cnt = 0; if (++cnt % 64 == 0) { fflush(f); }
+    return true;
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
@@ -1735,6 +1758,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    if (!cparams.cb_eval && getenv("EXPERT_TRACE")) { cparams.cb_eval = engine_lab_expert_trace_cb; }
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

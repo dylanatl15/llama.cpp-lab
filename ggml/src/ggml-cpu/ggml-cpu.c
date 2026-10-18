@@ -1643,6 +1643,15 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
     }
 
+    if (ids->ne[1] <= 8) {
+        // engine-lab: zero dst so skipped (negative id) rows read as 0
+        const size_t nbytes = ggml_nbytes(dst);
+        const size_t per = (nbytes + nth - 1)/nth;
+        const size_t beg = MIN((size_t) ith*per, nbytes);
+        const size_t end = MIN(beg + per, nbytes);
+        memset((char *) dst->data + beg, 0, end - beg);
+    }
+
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
@@ -1652,6 +1661,10 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
+                // engine-lab: negative ids are skipped, their dst rows stay zero (hybrid MoE: those experts are computed elsewhere)
+                if (i02 < 0) {
+                    continue;
+                }
                 assert(i02 >= 0 && i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
