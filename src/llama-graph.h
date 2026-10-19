@@ -1060,6 +1060,14 @@ struct llm_graph_context {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
 
+    // called once by build_moe_cache_slots after the selected experts are published and before the cache lookup is built
+    // the work built there is scheduled in the split that is still running while the CPU plans the uploads
+    mutable std::function<void()> moe_overlap;
+
+    // when set, build_moe_ffn hands the weighted per-expert outputs [n_embd, n_expert_used, n_tokens] to it and returns
+    // what it builds (nullptr: build the sum as usual)
+    mutable std::function<ggml_tensor * (ggml_tensor *)> moe_combine;
+
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;

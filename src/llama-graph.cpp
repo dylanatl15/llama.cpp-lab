@@ -2522,6 +2522,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_build_forward_expand(gf, experts);
 
+    if (moe_combine && experts->type == GGML_TYPE_F32 && experts->ne[2] == n_tokens) {
+        ggml_tensor * combined = moe_combine(experts);
+        if (combined != nullptr) {
+            cb(combined, "ffn_moe_out", il);
+            return combined;
+        }
+    }
+
     ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
 
     assert(n_expert_used > 0);
@@ -2582,6 +2590,22 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
         ids = ggml_cont(ctx0, ids);
     }
     ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
+
+    // decode: the GPU publishes the ids to a pinned host mailbox, so the copy callback does not have to synchronize the backend
+    // the work that does not depend on the lookup is built before it, it runs while the CPU plans the uploads
+    if (volatile int32_t * mb = moe_cache->get_mailbox(il, selected_experts->ne[1], selected_experts->ne[0])) {
+        ggml_tensor * mailbox = ggml_moe_mailbox(ctx0, ids, mb);
+        if (ggml_backend_supports_op(moe_cache->backend(il), mailbox)) {
+            ggml_backend_sched_set_tensor_backend(sched, mailbox, moe_cache->backend(il));
+            cb(mailbox, "ffn_moe_mailbox", il);
+            ggml_build_forward_expand(gf, mailbox);
+            ids = mailbox;
+            if (moe_overlap) {
+                moe_overlap();
+                moe_overlap = nullptr;
+            }
+        }
+    }
 
     // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
     // the callback reads the selected experts, uploads the missing ones and updates the slot map

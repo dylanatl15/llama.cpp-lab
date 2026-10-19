@@ -19,6 +19,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <chrono>
+#include <map>
+#include <string>
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
@@ -1820,7 +1823,25 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+struct lab_in_stat { double us = 0; long n = 0; };
+static void ggml_backend_sched_copy_input_impl(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input);
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+    static const bool lab_in = getenv("ENGINE_LAB_SCHT") && atoi(getenv("ENGINE_LAB_SCHT")) >= 2;
+    if (!lab_in) { ggml_backend_sched_copy_input_impl(sched, split, input); return; }
+    static std::map<std::string, lab_in_stat> stats; static long total = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    ggml_backend_sched_copy_input_impl(sched, split, input);
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    std::string nm = input->name; while (!nm.empty() && (isdigit((unsigned char)nm.back()) || nm.back() == '-')) nm.pop_back();
+    char key[256]; snprintf(key, sizeof key, "%s|flags%d|hw%d|ev%d|op%s", nm.c_str(), (int)input->flags, (int)ggml_backend_sched_is_host_weight(input),
+        (int)(sched->events[split->backend_id][sched->cur_copy] != NULL), ggml_op_name(input->op));
+    auto & st = stats[key]; st.us += us; st.n++;
+    if (++total % 8000 == 0) {
+        for (auto & kv : stats) { fprintf(stderr, "SCHIN: %-90s n=%ld avg %.1f us\n", kv.first.c_str(), kv.second.n, kv.second.us / kv.second.n); }
+        stats.clear();
+    }
+}
+static void ggml_backend_sched_copy_input_impl(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
@@ -1837,6 +1858,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
+    // lab: the copy callback orders its own work against the backend (readback synchronizes, the mailbox is published after the
+    // previous uploads completed), so the scheduler does not drain the backend before it, which would stall the CPU on the GPU tail of every split
+    static const bool lab_cb_sync = getenv("ENGINE_LAB_CB_SYNC") != nullptr;
+    if (!lab_cb_sync && sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+        return;
+    }
+
     // wait for the split backend to finish using the input before overwriting it
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -1844,7 +1873,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         ggml_backend_synchronize(split_backend);
     }
 
-    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+    if (lab_cb_sync && sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
         return;
     }
@@ -1868,8 +1897,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    static const bool lab_st = getenv("ENGINE_LAB_SCHT") != nullptr;
+    static double st_pre = 0, st_in = 0, st_cmp = 0, st_ev = 0, st_total = 0, st_entry_gap = 0; static long st_n = 0, st_calls = 0;
+    static std::chrono::steady_clock::time_point st_last_exit; static bool st_have_exit = false;
+    auto st_now = []() { return std::chrono::steady_clock::now(); };
+    auto st_us = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double, std::micro>(b - a).count(); };
+    const auto st_enter = st_now();
+    if (lab_st && st_have_exit) { st_entry_gap += st_us(st_last_exit, st_enter); }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
+        const auto st_a = st_now();
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
@@ -1883,6 +1921,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const auto st_b = st_now();
+        // lab: when the copy callback has to wait for the previous split (the MoE cache reads the selected experts back), record this split
+        // meanwhile and submit it behind the uploads of the callback
+        typedef void (*lab_defer_fn)(ggml_backend_t, int);
+        static const bool lab_defer_on = getenv("ENGINE_LAB_DEFER") != nullptr;
+        lab_defer_fn lab_defer = nullptr;
+        if (lab_defer_on && sched->callback_copy != NULL && !sched->callback_eval) {
+            for (int input_id = 0; input_id < split->n_inputs && !lab_defer; input_id++) {
+                if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(split_backend);
+                    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+                    lab_defer = reg ? (lab_defer_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_defer") : nullptr;
+                }
+            }
+        }
+
+        // lab: a split whose shapes were never executed before may make the Vulkan backend grow its prealloc buffers, which submits the
+        // half-recorded command buffers early (before the callback has read the expert ids). Run such splits normally once.
+        if (lab_defer) {
+            static std::map<uint64_t, bool> lab_seen;
+            uint64_t h = 1469598103934665603ull;
+            auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+            for (int ni = 0; ni < split->graph.n_nodes; ni++) {
+                const ggml_tensor * n = split->graph.nodes[ni];
+                mix(n->op); mix(n->type); for (int d = 0; d < 4; d++) mix(n->ne[d]);
+                for (int si = 0; si < GGML_MAX_SRC; si++) {
+                    const ggml_tensor * sn = n->src[si];
+                    if (sn) { mix(sn->type); for (int d = 0; d < 4; d++) mix(sn->ne[d]); }
+                }
+            }
+            mix(split->n_inputs);
+            if (lab_seen.emplace(h, true).second) {
+                lab_defer = nullptr;
+            }
+        }
+
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1890,12 +1964,43 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+        if (lab_defer) {
+            lab_defer(split_backend, 1);
+            const auto st_c0 = st_now();
+            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (ec != GGML_STATUS_SUCCESS) {
+                lab_defer(split_backend, 2);
+                return ec;
+            }
+            const auto st_c1 = st_now();
+            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                    ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                }
+            }
+            const auto st_c2 = st_now();
+            lab_defer(split_backend, 2);
+            const auto st_c3 = st_now();
+            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            }
+            prev_backend_id = split_backend_id;
+            if (lab_st) {
+                st_pre += st_us(st_a, st_b); st_in += st_us(st_b, st_c0) + st_us(st_c1, st_c2); st_cmp += st_us(st_c0, st_c1); st_ev += st_us(st_c2, st_c3);
+                if (++st_n % 5000 == 0) {
+                    fprintf(stderr, "SCHT: %ld splits | pre %.1f | inputs(+callback) %.1f | compute_async %.1f | flush %.1f us/split | between-call gap %.1f us/call (%ld calls) [defer]\n", st_n, st_pre/5000, st_in/5000, st_cmp/5000, st_ev/5000, st_calls ? st_entry_gap/st_calls : 0.0, st_calls);
+                    st_pre = st_in = st_cmp = st_ev = 0;
+                }
+            }
+            continue;
+        }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
 
+        const auto st_c = st_now();
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1935,13 +2040,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const auto st_d = st_now();
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
         prev_backend_id = split_backend_id;
+        if (lab_st) {
+            const auto st_e = st_now();
+            st_pre += st_us(st_a, st_b); st_in += st_us(st_b, st_c); st_cmp += st_us(st_c, st_d); st_ev += st_us(st_d, st_e);
+            if (++st_n % 5000 == 0) {
+                fprintf(stderr, "SCHT: %ld splits | pre %.1f | inputs(+callback) %.1f | compute_async %.1f | event %.1f us/split | between-call gap %.1f us/call (%ld calls)\n", st_n, st_pre/5000, st_in/5000, st_cmp/5000, st_ev/5000, st_calls ? st_entry_gap/st_calls : 0.0, st_calls);
+                st_pre = st_in = st_cmp = st_ev = 0;
+            }
+        }
     }
+    if (lab_st) { st_last_exit = st_now(); st_have_exit = true; st_calls++; }
 
     return GGML_STATUS_SUCCESS;
 }

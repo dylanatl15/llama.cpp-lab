@@ -1,0 +1,88 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// Everything a gated delta net layer does before the recurrence, for one token of one sequence:
+//   workgroups 0 .. C/128-1: one 128-channel group each: causal conv (4 taps over the 3 cached columns and the
+//   new column) + silu, the shifted conv state written back, and the per-head L2 norm for the first n_norm channels
+//   last workgroup: gate = softplus(alpha + dt)*a and beta = sigmoid(beta_raw)
+// Every channel is read and written by exactly one thread, so the conv state is updated in place.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer QkvBuf   { float data_qkv[];   };
+layout(binding = 1)           buffer CacheBuf { float data_cache[]; };
+layout(binding = 2) readonly  buffer ConvBuf  { float data_conv[];  };
+layout(binding = 3) readonly  buffer AlphaBuf { float data_alpha[]; };
+layout(binding = 4) readonly  buffer BetaBuf  { float data_beta[];  };
+layout(binding = 5) readonly  buffer DtBuf    { float data_dt[];    };
+layout(binding = 6) readonly  buffer ABuf     { float data_a[];     };
+layout(binding = 7) readonly  buffer IdxBuf   { int   data_idx[];   };
+layout(binding = 8)           buffer DstBuf   { float data_dst[];   };
+
+layout(push_constant) uniform Parameters {
+    uint C;
+    uint n_norm;
+    uint cell_stride;
+    uint dst_cell;
+    uint H;
+    float eps;
+    uint o_qkv, o_cache, o_conv, o_alpha, o_beta, o_dt, o_a, o_idx, o_dst;
+};
+
+shared float red[128];
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+    const uint g = gl_WorkGroupID.x;
+
+    if (g * 128u >= C) {
+        // gate and beta
+        if (t < 64u) {
+            float gt = 0.0;
+            float bt = 0.0;
+            if (t < H) {
+                const float al = data_alpha[o_alpha + t] + data_dt[o_dt + t];
+                const float sp = al > 20.0 ? al : log(1.0 + exp(al));
+                gt = sp * data_a[o_a + t];
+                bt = 1.0 / (1.0 + exp(-data_beta[o_beta + t]));
+            }
+            data_dst[o_dst + C + t]       = gt;
+            data_dst[o_dst + C + 64u + t] = bt;
+        }
+        return;
+    }
+
+    const uint c = g * 128u + t;
+    const uint in_base  = o_cache + uint(data_idx[o_idx]) * cell_stride + 3u * c;
+    const uint out_base = o_cache + dst_cell * cell_stride + 3u * c;
+
+    const float s0 = data_cache[in_base + 0u];
+    const float s1 = data_cache[in_base + 1u];
+    const float s2 = data_cache[in_base + 2u];
+    const float x  = data_qkv[o_qkv + c];
+
+    const vec4 w = vec4(data_conv[o_conv + 4u * c], data_conv[o_conv + 4u * c + 1u],
+                        data_conv[o_conv + 4u * c + 2u], data_conv[o_conv + 4u * c + 3u]);
+    float sum = dot(vec4(s0, s1, s2, x), w);
+    sum = sum / (1.0 + exp(-sum));
+
+    // all reads of this thread's three old columns are done above; the other threads own other channels
+    data_cache[out_base + 0u] = s1;
+    data_cache[out_base + 1u] = s2;
+    data_cache[out_base + 2u] = x;
+
+    if (g * 128u < n_norm) {
+        red[t] = sum * sum;
+        barrier();
+        [[unroll]] for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (t < s) {
+                red[t] += red[t + s];
+            }
+            barrier();
+        }
+        sum *= inversesqrt(red[0] + eps);
+    }
+
+    data_dst[o_dst + c] = sum;
+}

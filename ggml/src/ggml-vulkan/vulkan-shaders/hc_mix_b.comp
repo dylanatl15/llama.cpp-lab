@@ -26,7 +26,7 @@ layout(push_constant) uniform parameter
 
 layout(binding = 0, std430) readonly buffer X  { float data_x[]; };
 layout(binding = 1, std430) readonly buffer G  { float data_g[]; };
-layout(binding = 2, std430) readonly buffer WU { uint  data_wu[]; };
+layout(binding = 2, std430) readonly buffer WU { uvec4 data_wu[]; };
 layout(binding = 3, std430) buffer O           { float data_o[]; };
 
 #define N_EMBD 2560
@@ -40,12 +40,24 @@ const uint O_RSTD = O_LO + LO;
 const uint O_Q    = O_RSTD + HC;
 const uint O_P    = O_Q + HC;
 
-shared vec2  lo_s[LO / 2];
+shared vec4  lo_s[LO / 4];
 shared float red[256];
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint wg  = gl_WorkGroupID.x;
+
+    const uint slot   = tid >> 3;
+    const uint lane   = tid & 7;
+    const uint stream = slot & 3;
+    const uint pos    = wg * POS_PER_WG + (slot >> 2);
+    const uint rb     = (wu_off >> 2) + (stream * N_EMBD + pos) * (LO / 8);
+
+    // The weight loads do not depend on stage A: issue them before the prologue so their latency overlaps it.
+    uvec4 wv[(LO / 8) / 8];
+    [[unroll]] for (uint k = 0; k < (LO / 8) / 8; ++k) {
+        wv[k] = data_wu[rb + lane + k * 8];
+    }
 
     float rstd[HC];
     [[unroll]] for (uint s = 0; s < HC; ++s) {
@@ -57,7 +69,7 @@ void main() {
                             data_o[o_off + O_P + j * HC + 2], data_o[o_off + O_P + j * HC + 3]);
         const float v = dot(p, vec4(rstd[0], rstd[1], rstd[2], rstd[3])) * inv_hc;
         const float l = v / (1.0f + exp(-v));
-        lo_s[j >> 1][j & 1] = l;
+        lo_s[j >> 2][j & 3] = l;
         if (wg == 0) {
             data_o[o_off + O_LO + j] = l;
         }
@@ -75,19 +87,21 @@ void main() {
     }
     barrier();
 
-    const uint slot   = tid >> 3;
-    const uint lane   = tid & 7;
-    const uint stream = slot & 3;
-    const uint pos    = wg * POS_PER_WG + (slot >> 2);
-    const uint rb     = wu_off + (stream * N_EMBD + pos) * (LO / 2);
 
     float acc = 0.0f;
-    [[unroll]] for (uint k = 0; k < (LO / 2) / 8; ++k) {
+    [[unroll]] for (uint k = 0; k < (LO / 8) / 8; ++k) {
         const uint u  = lane + k * 8;
-        const uint wv = data_wu[rb + u];
-        const vec2 l  = lo_s[u];
-        acc = fma(l.x, uintBitsToFloat(wv << 16), acc);
-        acc = fma(l.y, uintBitsToFloat(wv & 0xffff0000u), acc);
+        const uvec4 w = wv[k];
+        const vec4 l0 = lo_s[2 * u];
+        const vec4 l1 = lo_s[2 * u + 1];
+        acc = fma(l0.x, uintBitsToFloat(w.x << 16), acc);
+        acc = fma(l0.y, uintBitsToFloat(w.x & 0xffff0000u), acc);
+        acc = fma(l0.z, uintBitsToFloat(w.y << 16), acc);
+        acc = fma(l0.w, uintBitsToFloat(w.y & 0xffff0000u), acc);
+        acc = fma(l1.x, uintBitsToFloat(w.z << 16), acc);
+        acc = fma(l1.y, uintBitsToFloat(w.z & 0xffff0000u), acc);
+        acc = fma(l1.z, uintBitsToFloat(w.w << 16), acc);
+        acc = fma(l1.w, uintBitsToFloat(w.w & 0xffff0000u), acc);
     }
     red[tid] = acc;
     barrier();

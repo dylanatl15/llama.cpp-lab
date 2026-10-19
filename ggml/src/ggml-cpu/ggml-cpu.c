@@ -2122,6 +2122,22 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_hc_mix(params, tensor);
             } break;
+        case GGML_OP_GDN_PRE:
+            {
+                ggml_compute_forward_gdn_pre(params, tensor);
+            } break;
+        case GGML_OP_MOE_COMBINE:
+            {
+                ggml_compute_forward_moe_combine(params, tensor);
+            } break;
+        case GGML_OP_GATED_NORM:
+            {
+                ggml_compute_forward_gated_norm(params, tensor);
+            } break;
+        case GGML_OP_MOE_MAILBOX:
+            {
+                ggml_compute_forward_moe_mailbox(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2305,6 +2321,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_HC_MIX:
+        case GGML_OP_GDN_PRE:
+        case GGML_OP_MOE_COMBINE:
+        case GGML_OP_GATED_NORM:
+        case GGML_OP_MOE_MAILBOX:
             {
                 n_tasks = 1;
             } break;

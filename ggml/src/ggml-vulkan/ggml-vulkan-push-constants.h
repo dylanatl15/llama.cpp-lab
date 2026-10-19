@@ -175,6 +175,48 @@ struct vk_op_dsv4_hc_comb_push_constants {
     uint32_t n_iter;
 };
 
+struct vk_op_moe_mailbox_push_constants {
+    uint32_t n;
+    uint32_t s_off;
+    uint32_t d_off;
+    uint32_t m_off;
+};
+
+struct vk_op_gdn_pre_push_constants {
+    uint32_t C;
+    uint32_t n_norm;
+    uint32_t cell_stride;
+    uint32_t dst_cell;
+    uint32_t H;
+    float eps;
+    uint32_t o_qkv, o_cache, o_conv, o_alpha, o_beta, o_dt, o_a, o_idx, o_dst;
+};
+
+struct vk_lab_mv_push_constants {
+    uint32_t nsb;
+    uint32_t nrows;
+    uint32_t meta_off;
+    uint32_t dst_off;
+};
+
+struct vk_lab_unpack_push_constants {
+    uint32_t nwords;
+    uint32_t meta_off;
+};
+
+struct vk_op_moe_combine_push_constants {
+    uint32_t E;
+    uint32_t K;
+    uint32_t has_sh;
+    uint32_t o_exp, o_sh, o_gate, o_dst;
+};
+
+struct vk_op_gated_norm_push_constants {
+    uint32_t D;
+    float eps;
+    uint32_t o_x, o_w, o_z, o_dst;
+};
+
 struct vk_op_hc_mix_push_constants {
     uint32_t n_embd;
     uint32_t lo_dim;
@@ -716,6 +758,8 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t cell_stride; // lab: nonzero selects cache mode (floats per cache cell)
+    uint32_t dst_cell;
 };
 
 struct vk_op_ssm_scan_push_constants {

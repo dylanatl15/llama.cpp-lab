@@ -11224,6 +11224,12 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_ASSERT(ggml_is_contiguous(src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_state));
 
+    // lab: cache mode reads cell idx[seq] of the cache and writes cell dst_cell + seq back in place
+    const bool cache_mode = ggml_get_op_params_i32(dst, 1) == 1;
+    const int32_t * cache_idx = cache_mode ? (const int32_t *) dst->src[6]->data : nullptr;
+    const int64_t cache_dst_cell = cache_mode ? ggml_get_op_params_i32(dst, 2) : 0;
+    const int64_t cache_cell_f32 = cache_mode ? src_state->nb[1] / sizeof(float) : 0;
+
     GGML_ASSERT(src_g->ne[0] == 1 || src_g->ne[0] == S_v);
     GGML_ASSERT(src_beta->ne[0] == 1);
 
@@ -11286,11 +11292,18 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         float * s_out = (K > 1)
             ? state_work
             : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        if (cache_mode) {
+            s_out = (float *) src_state->data + (cache_dst_cell + iv3) * cache_cell_f32 + iv1 * S_v * S_v;
+        }
 
         // copy input state into the working buffer and operate in-place
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        const float * s_in = cache_mode
+            ? state_in_base + (int64_t) cache_idx[iv3] * cache_cell_f32 + iv1 * S_v * S_v
+            : state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        if (s_in != s_out) {
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -11627,6 +11640,163 @@ void ggml_compute_forward_dsv4_hc_pre(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_moe_mailbox
+
+void ggml_compute_forward_moe_mailbox(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * ids = dst->src[0];
+    const int64_t n = ggml_nelements(ids);
+    int64_t ptr;
+    memcpy(&ptr, dst->op_params, sizeof(ptr));
+    volatile int32_t * mb = (volatile int32_t *) (intptr_t) ptr;
+    const int32_t * src = (const int32_t *) ids->data;
+    int32_t * out = (int32_t *) dst->data;
+    for (int64_t i = 0; i < n; ++i) {
+        out[i] = src[i];
+        if (mb) mb[i] = src[i];
+    }
+}
+
+// ggml_compute_forward_gdn_pre
+
+void ggml_compute_forward_gdn_pre(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * qkv   = dst->src[0];
+    const ggml_tensor * cache = dst->src[1];
+    const ggml_tensor * conv  = dst->src[2];
+    const ggml_tensor * alpha = dst->src[3];
+    const ggml_tensor * beta  = dst->src[4];
+    const ggml_tensor * dt    = dst->src[5];
+    const ggml_tensor * a     = dst->src[6];
+    const ggml_tensor * idx   = dst->src[7];
+
+    const int64_t C        = qkv->ne[0];
+    const int64_t H        = alpha->ne[0];
+    const int64_t dst_cell = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_norm   = ggml_get_op_params_i32(dst, 1);
+    const float   eps      = ggml_get_op_params_f32(dst, 2);
+
+    float * out = (float *) dst->data;
+    float * cf  = (float *) cache->data;
+    const float * cin  = cf + (int64_t) ((const int32_t *) idx->data)[0]*cache->nb[1]/sizeof(float);
+    float *       cout = cf + dst_cell*cache->nb[1]/sizeof(float);
+
+    const float * x  = (const float *) qkv->data;
+    const float * w  = (const float *) conv->data;
+
+    // read the whole old state before any write: the source and destination cells may be the same
+    std::vector<float> state_in(cin, cin + 3*C);
+
+    for (int64_t c = 0; c < C; ++c) {
+        const float * s = state_in.data() + 3*c;
+        float sum = s[0]*w[4*c + 0] + s[1]*w[4*c + 1] + s[2]*w[4*c + 2] + x[c]*w[4*c + 3];
+        out[c] = sum/(1.0f + expf(-sum));
+        cout[3*c + 0] = s[1];
+        cout[3*c + 1] = s[2];
+        cout[3*c + 2] = x[c];
+    }
+
+    for (int64_t g = 0; g < n_norm/128; ++g) {
+        float q = 0.0f;
+        for (int64_t i = 0; i < 128; ++i) {
+            q += out[g*128 + i]*out[g*128 + i];
+        }
+        const float r = 1.0f/sqrtf(q + eps);
+        for (int64_t i = 0; i < 128; ++i) {
+            out[g*128 + i] *= r;
+        }
+    }
+
+    const float * al = (const float *) alpha->data;
+    const float * be = (const float *) beta->data;
+    const float * dv = (const float *) dt->data;
+    const float * av = (const float *) a->data;
+    for (int64_t h = 0; h < 64; ++h) {
+        out[C + h]      = h < H ? ggml_compute_softplus_f32(al[h] + dv[h])*av[h] : 0.0f;
+        out[C + 64 + h] = h < H ? 1.0f/(1.0f + expf(-be[h])) : 0.0f;
+    }
+}
+
+// ggml_compute_forward_moe_combine
+
+void ggml_compute_forward_moe_combine(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * experts = dst->src[0];
+    const ggml_tensor * shexp   = dst->src[1];
+    const ggml_tensor * gate    = dst->src[2];
+
+    const int64_t E = experts->ne[0];
+    const int64_t K = experts->ne[1];
+    const int64_t T = experts->ne[2];
+
+    for (int64_t t = 0; t < T; ++t) {
+        const float * xe = (const float *) experts->data + t*E*K;
+        float * out = (float *) dst->data + t*E;
+        const float g = shexp ? 1.0f/(1.0f + expf(-((const float *) gate->data)[t])) : 0.0f;
+        for (int64_t e = 0; e < E; ++e) {
+            float sum = xe[e];
+            for (int64_t k = 1; k < K; ++k) {
+                sum += xe[k*E + e];
+            }
+            if (shexp) {
+                sum += ((const float *) shexp->data)[t*E + e]*g;
+            }
+            out[e] = sum;
+        }
+    }
+}
+
+// ggml_compute_forward_gated_norm
+
+void ggml_compute_forward_gated_norm(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const ggml_tensor * z = dst->src[2];
+
+    const int64_t D   = x->ne[0];
+    const float   eps = ggml_get_op_params_f32(dst, 0);
+
+    const float * wf = (const float *) w->data;
+    int64_t row = 0;
+    for (int64_t i3 = 0; i3 < x->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < x->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < x->ne[1]; ++i1, ++row) {
+                const float * xr = (const float *) ((const char *) x->data + i1*x->nb[1] + i2*x->nb[2] + i3*x->nb[3]);
+                const float * zr = (const float *) z->data + row*D;
+                float * dr = (float *) dst->data + row*D;
+                float q = 0.0f;
+                for (int64_t d = 0; d < D; ++d) {
+                    q += xr[d]*xr[d];
+                }
+                const float r = 1.0f/sqrtf(q/(float) D + eps);
+                for (int64_t d = 0; d < D; ++d) {
+                    dr[d] = (xr[d]*r*wf[d])*(1.0f/(1.0f + expf(-zr[d])));
+                }
+            }
+        }
     }
 }
 

@@ -1,0 +1,26 @@
+#version 450
+
+// copies the selected expert ids and publishes them to a pinned host buffer that the CPU polls
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer S {int src[];};
+layout (binding = 1) writeonly buffer D {int dst[];};
+layout (binding = 2) coherent writeonly buffer M {int mb[];};
+
+layout (push_constant) uniform parameter {
+    uint n;
+    uint s_off;
+    uint d_off;
+    uint m_off;
+} p;
+
+void main() {
+    const uint i = gl_LocalInvocationID.x;
+    if (i < p.n) {
+        const int v = src[p.s_off + i];
+        dst[p.d_off + i] = v;
+        mb[p.m_off + i] = v;
+    }
+    memoryBarrierBuffer();
+}

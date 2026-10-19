@@ -1,0 +1,79 @@
+#version 450
+// Engine-lab: decode-time matvec over repacked IQ4_XS weights (see ggml-vulkan-lab.h).
+// One 16-lane cluster per output row, one lane per 32-value sub-block (16 B load), q8_1 activations.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer A  { uvec4 a_qs[]; };
+layout(binding = 0) readonly buffer A2 { uvec2 a_meta[]; };
+layout(binding = 1) readonly buffer B  { uvec4 bq[]; };          // block_q8_1_x4: 9 uvec4 per 128 values
+layout(binding = 2) writeonly buffer D { float dst[]; };
+
+layout(push_constant) uniform P {
+    uint nsb;        // sub-blocks (32 values) per row
+    uint nrows;
+    uint meta_off;   // offset of the header stream in uvec2 units
+    uint dst_off;    // dst element offset
+} pc;
+
+shared uint lut2[256];
+
+const int kv[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+
+#define BY(v, n) (((v) >> (8 * (n))) & 0xffu)
+#define WD(v, n) (lut2[BY(v, n)] | (lut2[BY(v, (n) + 1)] << 16))
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    for (uint i = lid; i < 256; i += 64) {
+        lut2[i] = uint(kv[i & 15] & 0xff) | (uint(kv[i >> 4] & 0xff) << 8);
+    }
+    barrier();
+
+    const uint lane = lid & 15;
+    const uint row  = gl_WorkGroupID.x * 4 + (lid >> 4);
+    const uint rowc = min(row, pc.nrows - 1);
+    const uint nblk_row = pc.nsb >> 3;
+
+    float acc = 0.0;
+    [[unroll]] for (uint s = lane; s < pc.nsb; s += 16) {
+        // activations
+        const uint xb = (s >> 2) * 9;
+        const uint xi = s & 3;
+        const uvec4 dsv = bq[xb];
+        const uint dsw = xi == 0 ? dsv.x : (xi == 1 ? dsv.y : (xi == 2 ? dsv.z : dsv.w));
+        const float dx = unpackHalf2x16(dsw).x;
+        const uvec4 xa = bq[xb + 1 + 2 * xi];
+        const uvec4 xc = bq[xb + 2 + 2 * xi];
+
+        // weights
+        const uvec4 w = a_qs[rowc * pc.nsb + s];
+        const uvec2 m = a_meta[pc.meta_off + rowc * nblk_row + (s >> 3)];
+        const uint ib = s & 7;
+        const float d = unpackHalf2x16(m.x & 0xffffu).x;
+        const uint sh = m.x >> 16;
+        const uint ls = ((m.y >> (4 * (ib & 1) + 8 * (ib >> 1))) & 0xfu) | (((sh >> (2 * ib)) & 3u) << 4);
+
+        int dot = 0;
+        dot = dotPacked4x8AccSatEXT(int(WD(w.x, 0)), int(xa.x), dot);
+        dot = dotPacked4x8AccSatEXT(int(WD(w.x, 2)), int(xa.y), dot);
+        dot = dotPacked4x8AccSatEXT(int(WD(w.y, 0)), int(xa.z), dot);
+        dot = dotPacked4x8AccSatEXT(int(WD(w.y, 2)), int(xa.w), dot);
+        dot = dotPacked4x8AccSatEXT(int(WD(w.z, 0)), int(xc.x), dot);
+        dot = dotPacked4x8AccSatEXT(int(WD(w.z, 2)), int(xc.y), dot);
+        dot = dotPacked4x8AccSatEXT(int(WD(w.w, 0)), int(xc.z), dot);
+        dot = dotPacked4x8AccSatEXT(int(WD(w.w, 2)), int(xc.w), dot);
+        acc += d * float(int(ls) - 32) * dx * float(dot);
+    }
+
+    acc = subgroupClusteredAdd(acc, 16);
+    if (lane == 0 && row < pc.nrows) {
+        dst[pc.dst_off + row] = acc;
+    }
+}

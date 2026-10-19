@@ -1,0 +1,44 @@
+#version 450
+// Engine-lab: restore the original IQ4_XS block layout from the repacked streams.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer A  { uvec4 a_qs[]; };
+layout(binding = 0) readonly buffer A2 { uvec2 a_meta[]; };
+layout(binding = 1) writeonly buffer D { uint dst[]; };
+
+layout(push_constant) uniform P {
+    uint nwords;     // total output words (nblk * 34)
+    uint meta_off;   // uvec2 units
+} pc;
+
+uint get_byte(uvec4 v, uint i) {
+    const uint w = i < 8 ? (i < 4 ? v.x : v.y) : (i < 12 ? v.z : v.w);
+    return (w >> (8 * (i & 3))) & 0xffu;
+}
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65535u * 256u;
+    if (gid >= pc.nwords) { return; }
+    const uint blk = gid / 34;
+    const uint wi  = gid % 34;
+    if (wi < 2) {
+        const uvec2 m = a_meta[pc.meta_off + blk];
+        dst[gid] = wi == 0 ? m.x : m.y;
+        return;
+    }
+    const uint q  = wi - 2;          // word within qs (0..31)
+    const uint ib = q >> 2;          // sub-block
+    const uint t  = q & 3;           // word within sub-block
+    const uvec4 n = a_qs[blk * 8 + ib];
+    uint outw = 0;
+    [[unroll]] for (uint b = 0; b < 4; b++) {
+        const uint j = 4 * t + b;
+        const uint lo = (get_byte(n, j >> 1) >> (4 * (j & 1))) & 0xfu;
+        const uint hi = (get_byte(n, 8 + (j >> 1)) >> (4 * (j & 1))) & 0xfu;
+        outw |= (lo | (hi << 4)) << (8 * b);
+    }
+    dst[gid] = outw;
+}

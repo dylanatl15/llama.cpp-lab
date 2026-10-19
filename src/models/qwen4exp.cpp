@@ -677,6 +677,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * gate,
         int           layer) {
     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu
+    static const bool lab_gated_norm = [] { const char * e = getenv("LAB_GATED_NORM"); return !e || atoi(e) != 0; }();
+    if (lab_gated_norm && ggml_is_contiguous(input) && input->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(gate) && weights->type == GGML_TYPE_F32) {
+        ggml_tensor * out = ggml_gated_norm(ctx0, input, weights, gate, hparams.f_norm_rms_eps);
+        cb(out, "gated_norm", layer);
+        return out;
+    }
+
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated = ggml_sigmoid(ctx0, gate);
 
@@ -1078,25 +1086,40 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
+    // lab: LAB_GDN_CACHE=1 lets the fused GDN read and update the recurrent cache cell directly,
+    // dropping the state gather and the final state copy (3 MB each way per layer)
+    static const bool lab_gdn_cache = [] { const char * e = getenv("LAB_GDN_CACHE"); return !e || atoi(e) != 0; }();
+    const bool gdn_cache = lab_gdn_cache && cparams.n_rs_seq == 0 && n_seqs == 1 && mctx_cur->get_n_rs() == 1 &&
+            (n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch);
+    // lab: LAB_GDN_PRE=1 (decode) also folds the conv, silu, q/k norm, gate and beta math into one op
+    static const bool lab_gdn_pre = [] { const char * e = getenv("LAB_GDN_PRE"); return !e || atoi(e) != 0; }();
+    const bool gdn_pre = gdn_cache && lab_gdn_pre && n_seq_tokens == 1 && model.layers[il].ssm_conv1d->ne[0] == 4 &&
+            hparams.ssm_d_state == 128 && model.layers[il].ssm_beta_s == nullptr && model.layers[il].ssm_alpha_s == nullptr;
+
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
-    beta = ggml_sigmoid(ctx0, beta);
-    cb(beta, "beta_sigmoid", il);
+    if (!gdn_pre) {
+        beta = ggml_sigmoid(ctx0, beta);
+        cb(beta, "beta_sigmoid", il);
+    }
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
-    ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
-    cb(alpha_softplus, "a_softplus", il);
+    ggml_tensor * gate = nullptr;
+    if (!gdn_pre) {
+        ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+        ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+        cb(alpha_softplus, "a_softplus", il);
 
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
-    cb(gate, "gate", il);
+        gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+        cb(gate, "gate", il);
 
-    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+        gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    }
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
@@ -1107,51 +1130,82 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // the channels must match how load_arch_tensors sizes wqkv, not ssm_d_inner
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
-    ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
+    ggml_tensor * conv_input = gdn_pre ? nullptr : build_conv_state_at(inp, conv_states_all, qkv_mixed,
             conv_kernel_size - 1, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
-
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
-
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
-    cb(conv_output_silu, "conv_output_silu", il);
-
-    ggml_tensor * conv_qkv_mix = conv_output_silu;
-
-    int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, conv_channels);
-
-    // Extract the convolved Q, K, V from conv_output
-    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            0);
-
-    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
-
-    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_v_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
-
-    cb(q_conv, "q_conv", il);
-    cb(k_conv, "k_conv", il);
-    cb(v_conv, "v_conv", il);
-
+    ggml_tensor * state = nullptr;
+    if (gdn_cache) {
+        // same clearing of the zero cell as build_rs(): the s_copy index then points a fresh sequence at it
+        const int32_t rs_zero = mctx_cur->get_rs_z();
+        ggml_tensor * states = ggml_reshape_2d(ctx0, ssm_states_all, hparams.n_embd_s(), ssm_states_all->ne[1]);
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, hparams.n_embd_s()*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    } else {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+    }
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    ggml_tensor * q_conv = nullptr;
+    ggml_tensor * k_conv = nullptr;
+    ggml_tensor * v_conv = nullptr;
+
+    if (gdn_pre) {
+        // the conv state cell is cleared the same way as the recurrent one
+        const int32_t rs_zero = mctx_cur->get_rs_z();
+        ggml_tensor * rstates = ggml_reshape_2d(ctx0, conv_states_all, conv_states_all->ne[0], conv_states_all->ne[1]);
+        ggml_tensor * r_zero  = ggml_view_1d(ctx0, rstates, rstates->ne[0]*(rs_zero >= 0), rs_zero*rstates->nb[1]*(rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, r_zero, 0));
+
+        ggml_tensor * pre = ggml_gdn_pre(ctx0, qkv_mixed, rstates, conv_kernel, alpha, beta, model.layers[il].ssm_dt,
+                model.layers[il].ssm_a, inp->s_copy_main, mctx_cur->get_head(), head_k_dim * num_k_heads * 2, eps_norm);
+        cb(pre, "gdn_pre", il);
+
+        const size_t fs = sizeof(float);
+        q_conv = ggml_view_4d(ctx0, pre, head_k_dim, num_k_heads, 1, 1, fs*head_k_dim, fs*head_k_dim*num_k_heads, fs*head_k_dim*num_k_heads, 0);
+        k_conv = ggml_view_4d(ctx0, pre, head_k_dim, num_k_heads, 1, 1, fs*head_k_dim, fs*head_k_dim*num_k_heads, fs*head_k_dim*num_k_heads, fs*head_k_dim*num_k_heads);
+        v_conv = ggml_view_4d(ctx0, pre, head_v_dim, num_v_heads, 1, 1, fs*head_v_dim, fs*head_v_dim*num_v_heads, fs*head_v_dim*num_v_heads, fs*2*head_k_dim*num_k_heads);
+        gate   = ggml_view_4d(ctx0, pre, 1, num_v_heads, 1, 1, fs, fs, fs*num_v_heads, fs*conv_channels);
+        beta   = ggml_view_4d(ctx0, pre, 1, num_v_heads, 1, 1, fs, fs, fs*num_v_heads, fs*(conv_channels + 64));
+    } else {
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+
+        ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        cb(conv_output_silu, "conv_output_silu", il);
+
+        ggml_tensor * conv_qkv_mix = conv_output_silu;
+
+        int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, conv_channels);
+
+        // Extract the convolved Q, K, V from conv_output
+        q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * n_seq_tokens,
+                0);
+
+        k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * n_seq_tokens,
+                head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
+
+        v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_v_dim),
+                nb1_qkv,
+                nb1_qkv * n_seq_tokens,
+                ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
+
+        cb(q_conv, "q_conv", il);
+        cb(k_conv, "k_conv", il);
+        cb(v_conv, "v_conv", il);
+
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
@@ -1164,7 +1218,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output = nullptr;
+    if (gdn_cache) {
+        ggml_tensor * states = ggml_reshape_2d(ctx0, ssm_states_all, hparams.n_embd_s(), ssm_states_all->ne[1]);
+        ggml_tensor * gdn_out = ggml_gated_delta_net_cache(ctx0, q_conv, k_conv, v_conv, gate, beta, states,
+                inp->s_copy_main, mctx_cur->get_head());
+        res->add_fused_node({n_seq_tokens == 1 ? LLM_FUSED_OP_GDN_AR : LLM_FUSED_OP_GDN_CH, gdn_out, il});
+        output = ggml_view_4d(ctx0, gdn_out, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(gdn_out->type, head_v_dim),
+                ggml_row_size(gdn_out->type, head_v_dim * num_v_heads),
+                ggml_row_size(gdn_out->type, head_v_dim * num_v_heads * n_seq_tokens), 0);
+        cb(output, "attn_output", il);
+    } else {
+        output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    }
 
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
@@ -1185,6 +1252,54 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // shared experts, as in the Qwen3Next reference
+    // built before the cache lookup of the routed experts when the cache is used, so they run while the CPU plans the uploads
+    ggml_tensor * ffn_shexp = nullptr;
+    ggml_tensor * shexp_gate_raw = nullptr;
+    static const bool lab_moe_combine = [] { const char * e = getenv("LAB_MOE_COMBINE"); return !e || atoi(e) != 0; }();
+    const bool fuse_combine = lab_moe_combine && n_tokens == 1 && model.layers[il].ffn_up_shexp != nullptr;
+    auto build_shexp = [&]() {
+        if (model.layers[il].ffn_up_shexp == nullptr || ffn_shexp != nullptr) {
+            return;
+        }
+        ffn_shexp =
+            build_ffn(cur,
+                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(ffn_shexp, "ffn_shexp", il);
+
+        // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
+        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+        cb(shared_gate, "shared_expert_gate", il);
+
+        if (fuse_combine) {
+            // the gate and its sigmoid are applied in the combine op
+            shexp_gate_raw = shared_gate;
+            ggml_build_forward_expand(gf, ffn_shexp);
+            ggml_build_forward_expand(gf, shared_gate);
+            return;
+        }
+
+        shared_gate = ggml_sigmoid(ctx0, shared_gate);
+        cb(shared_gate, "shared_expert_gate_sigmoid", il);
+
+        ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+        cb(ffn_shexp, "ffn_shexp_gated", il);
+        ggml_build_forward_expand(gf, ffn_shexp);
+    };
+    moe_overlap = build_shexp;
+    bool combined = false;
+    if (fuse_combine) {
+        moe_combine = [&](ggml_tensor * experts) -> ggml_tensor * {
+            build_shexp();
+            combined = true;
+            return ggml_moe_combine(ctx0, experts, ffn_shexp, shexp_gate_raw);
+        };
+    }
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -1202,27 +1317,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_down_exps_s);
     cb(moe_out, "ffn_moe_out", il);
 
-    // shared experts, as in the Qwen3Next reference
-    if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
-            build_ffn(cur,
-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
-
-        // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
-        cb(shared_gate, "shared_expert_gate", il);
-
-        shared_gate = ggml_sigmoid(ctx0, shared_gate);
-        cb(shared_gate, "shared_expert_gate_sigmoid", il);
-
-        ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
-        cb(ffn_shexp, "ffn_shexp_gated", il);
-
+    moe_overlap = nullptr;
+    moe_combine = nullptr;
+    build_shexp();
+    if (combined) {
+        cur = moe_out;
+        cb(cur, "ffn_out", il);
+    } else if (ffn_shexp != nullptr) {
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
     } else {

@@ -1,0 +1,46 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// rms_norm(x)*w*sigmoid(z) over one row per workgroup (the gated delta net output norm)
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer XBuf   { float data_x[];   };
+layout(binding = 1) readonly buffer WBuf   { float data_w[];   };
+layout(binding = 2) readonly buffer ZBuf   { float data_z[];   };
+layout(binding = 3)          buffer DstBuf { float data_dst[]; };
+
+layout(push_constant) uniform Parameters {
+    uint D;
+    float eps;
+    uint o_x, o_w, o_z, o_dst;
+};
+
+shared float red[128];
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+    const uint row = gl_WorkGroupID.x;
+    const uint base = row * D;
+
+    float q = 0.0;
+    for (uint d = t; d < D; d += 128u) {
+        const float v = data_x[o_x + base + d];
+        q += v * v;
+    }
+    red[t] = q;
+    barrier();
+    [[unroll]] for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (t < s) {
+            red[t] += red[t + s];
+        }
+        barrier();
+    }
+    const float r = 1.0 / sqrt(red[0] / float(D) + eps);
+
+    for (uint d = t; d < D; d += 128u) {
+        const float zv = data_z[o_z + base + d];
+        data_dst[o_dst + base + d] = (data_x[o_x + base + d] * r * data_w[o_w + d]) * (1.0 / (1.0 + exp(-zv)));
+    }
+}

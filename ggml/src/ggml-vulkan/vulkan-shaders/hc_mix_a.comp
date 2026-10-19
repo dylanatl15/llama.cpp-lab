@@ -38,8 +38,8 @@ layout(push_constant) uniform parameter
 
 layout(binding = 0, std430) readonly buffer X  { float data_x[]; };
 layout(binding = 1, std430) readonly buffer G  { float data_g[]; };
-layout(binding = 2, std430) readonly buffer WD { uint  data_wd[]; };
-layout(binding = 3, std430) readonly buffer WI { uint  data_wi[]; };
+layout(binding = 2, std430) readonly buffer WD { uvec4 data_wd[]; };
+layout(binding = 3, std430) readonly buffer WI { uvec4 data_wi[]; };
 layout(binding = 4, std430) buffer O           { float data_o[]; };
 
 #define N_EMBD 2560
@@ -51,10 +51,12 @@ layout(binding = 4, std430) buffer O           { float data_o[]; };
 const uint O_Q = N_EMBD + HC + LO + HC;
 const uint O_P = O_Q + HC;
 
-shared vec2  xg[HALF_N];
+shared vec4  xg[N_EMBD / 4];   // x*gamma of this stream, 4 per vec4
 shared float qsh[32];
 
-#define NU (HALF_N / 64)   // uints per lane (subgroup size 64)
+
+// Weight rows are read as uvec4 (8 bf16): a row slice is N_EMBD/8 = 320 of them, SG_SIZE lanes stride over it.
+#define NV_MAX (N_EMBD / 8 / 32)
 
 void main() {
     const uint tid  = gl_LocalInvocationID.x;
@@ -64,32 +66,28 @@ void main() {
     const uint row  = g * rows_per_wg + gl_SubgroupID;
 
     // Issue the weight loads first so their latency overlaps the x/gamma staging below.
-    uint wv[HALF_N / 32];
-    const uint nu = HALF_N / SG_SIZE;
+    uvec4 wv[NV_MAX];
+    const uint nv = (N_EMBD / 8) / SG_SIZE;
     if (row < LO + HC) {
         if (row < LO) {
-            const uint base = wd_off + row * (HC * HALF_N) + s * HALF_N + lane;
-            [[unroll]] for (uint k = 0; k < HALF_N / 32; ++k) {
-                if (k < nu) wv[k] = data_wd[base + k * SG_SIZE];
+            const uint base = (wd_off >> 2) + row * (HC * N_EMBD / 8) + s * (N_EMBD / 8) + lane;
+            [[unroll]] for (uint k = 0; k < NV_MAX; ++k) {
+                if (k < nv) wv[k] = data_wd[base + k * SG_SIZE];
             }
         } else {
-            const uint base = wi_off + (row - LO) * (HC * HALF_N) + s * HALF_N + lane;
-            [[unroll]] for (uint k = 0; k < HALF_N / 32; ++k) {
-                if (k < nu) wv[k] = data_wi[base + k * SG_SIZE];
+            const uint base = (wi_off >> 2) + (row - LO) * (HC * N_EMBD / 8) + s * (N_EMBD / 8) + lane;
+            [[unroll]] for (uint k = 0; k < NV_MAX; ++k) {
+                if (k < nv) wv[k] = data_wi[base + k * SG_SIZE];
             }
         }
     }
 
     float q = 0.0f;
-    [[unroll]] for (uint k = 0; k < HALF_N / 256 + 1; ++k) {
-        const uint u = tid + k * 256;
-        if (u < HALF_N) {
-            const uint e = x_off + s * N_EMBD + 2 * u;
-            const uint ge = g_off + s * N_EMBD + 2 * u;
-            const vec2 x = vec2(data_x[e], data_x[e + 1]);
-            xg[u] = x * vec2(data_g[ge], data_g[ge + 1]);
-            q = fma(x.x, x.x, fma(x.y, x.y, q));
-        }
+    [[unroll]] for (uint k = 0; k < N_EMBD / 256; ++k) {
+        const uint i = tid + k * 256;
+        const float x = data_x[x_off + s * N_EMBD + i];
+        xg[i >> 2][i & 3] = x * data_g[g_off + s * N_EMBD + i];
+        q = fma(x, x, q);
     }
     q = subgroupAdd(q);
     if (subgroupElect()) {
@@ -99,11 +97,20 @@ void main() {
 
     if (row < LO + HC) {
         float p = 0.0f;
-        [[unroll]] for (uint k = 0; k < HALF_N / 32; ++k) {
-            if (k < nu) {
-                const vec2 a = xg[lane + k * SG_SIZE];
-                p = fma(a.x, uintBitsToFloat(wv[k] << 16), p);
-                p = fma(a.y, uintBitsToFloat(wv[k] & 0xffff0000u), p);
+        [[unroll]] for (uint k = 0; k < NV_MAX; ++k) {
+            if (k < nv) {
+                const uint u = lane + k * SG_SIZE;
+                const vec4 a0 = xg[2 * u];
+                const vec4 a1 = xg[2 * u + 1];
+                const uvec4 w = wv[k];
+                p = fma(a0.x, uintBitsToFloat(w.x << 16), p);
+                p = fma(a0.y, uintBitsToFloat(w.x & 0xffff0000u), p);
+                p = fma(a0.z, uintBitsToFloat(w.y << 16), p);
+                p = fma(a0.w, uintBitsToFloat(w.y & 0xffff0000u), p);
+                p = fma(a1.x, uintBitsToFloat(w.z << 16), p);
+                p = fma(a1.y, uintBitsToFloat(w.z & 0xffff0000u), p);
+                p = fma(a1.z, uintBitsToFloat(w.w << 16), p);
+                p = fma(a1.w, uintBitsToFloat(w.w & 0xffff0000u), p);
             }
         }
         p = subgroupAdd(p);

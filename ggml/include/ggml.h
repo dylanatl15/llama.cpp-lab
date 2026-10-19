@@ -586,6 +586,10 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_HC_MIX,
+        GGML_OP_GDN_PRE,
+        GGML_OP_MOE_COMBINE,
+        GGML_OP_GATED_NORM,
+        GGML_OP_MOE_MAILBOX,
 
         GGML_OP_UNARY,
 
@@ -2666,6 +2670,23 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // gated delta net reading and updating a recurrent cache in place (lab, K == 1)
+    //
+    // cache:  F32 [D, n_cells], D = S_v*S_v*H; idx: I32 [>= n_seqs]
+    // sequence s starts from cache cell idx[s] and its final state is written to cell dst_cell + s.
+    // the output holds the attention scores only: [S_v*H, n_tokens*n_seqs].
+    // the caller guarantees that no two sequences alias (n_seqs == 1, or disjoint read/write cells)
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_cache(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * cache,
+            struct ggml_tensor  * idx,
+            int64_t               dst_cell);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
@@ -2752,6 +2773,56 @@ extern "C" {
             struct ggml_tensor  * w_up,
             struct ggml_tensor  * w_inject,
             float                 eps);
+
+    // gdn_pre (decode, one token, one sequence): everything a gated delta net layer does before the recurrence,
+    // in one op, and the conv state update in place.
+    //   qkv   [C] f32 raw projection (q, k, v channels), cache [3*C, n_cells] f32 conv states (3 columns per channel)
+    //   conv  [4, C] f32 depthwise kernel, alpha/beta [H] f32 raw projections, dt/a [H] f32 per-head parameters
+    //   idx   [>=1] i32: cell the conv state is read from; the shifted state is written to cell dst_cell
+    //   x[c]   = silu(sum_k conv[k, c]*[state_0, state_1, state_2, qkv][k, c]); the first n_norm channels are then
+    //            scaled per head of 128 by rsqrt(sum(x^2) + eps) (the q/k L2 norm)
+    //   gate[h] = softplus(alpha[h] + dt[h])*a[h],  beta[h] = sigmoid(beta_raw[h])
+    // The result is one f32 vector: x [C], then at C the H gates and at C + 64 the H betas (padded, so a view onto
+    // each starts at an aligned offset); length C + 128 (the padding is zero).
+    GGML_API struct ggml_tensor * ggml_gdn_pre(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * qkv,
+            struct ggml_tensor  * cache,
+            struct ggml_tensor  * conv,
+            struct ggml_tensor  * alpha,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * idx,
+            int64_t               dst_cell,
+            int64_t               n_norm,
+            float                 eps);
+
+    // moe_combine: the tail of an MoE layer with a shared expert in one op.
+    //   experts [E, K, T] f32 contiguous (already weighted), shexp [E, T] f32 and gate [1, T] f32 (raw logit), both optional
+    //   dst[e, t] = (((experts[e,0,t] + experts[e,1,t]) + ...) + experts[e,K-1,t]) + shexp[e,t]*sigmoid(gate[t])
+    GGML_API struct ggml_tensor * ggml_moe_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * shexp,
+            struct ggml_tensor  * gate);
+
+    // gated_norm: rms_norm(x)*w*sigmoid(z) over the rows of x (the gated delta net output norm)
+    //   x, z [D, ...] f32 same shape, w [D] f32; the result has the shape of x
+    GGML_API struct ggml_tensor * ggml_gated_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * z,
+            float                 eps);
+
+    // returns a copy of the i32 ids and also publishes them to the pinned host buffer `mailbox` (ids->ne[0] i32 values)
+    // as soon as the producing op has run, so the CPU can poll for them without synchronizing the backend.
+    // backends that cannot write host memory from the GPU copy the ids only, see ggml_moe_mailbox_host
+    GGML_API struct ggml_tensor * ggml_moe_mailbox(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            volatile int32_t    * mailbox);
 
     // custom operators
 

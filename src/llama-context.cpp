@@ -1575,6 +1575,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (ubatch.n_tokens == 1 && getenv("ENGINE_LAB_DUMP_GRAPH")) {
+        static bool dumped = false; // lab: one line per node of the first decode graph, for fusion hunting
+        if (!dumped) {
+            dumped = true;
+            ggml_cgraph * g = res->get_gf();
+            FILE * f = fopen(getenv("ENGINE_LAB_DUMP_GRAPH"), "w");
+            for (int i = 0; f && i < ggml_graph_n_nodes(g); ++i) {
+                ggml_tensor * t = ggml_graph_node(g, i);
+                fprintf(f, "%d %s %s [%lld,%lld,%lld,%lld] %s", i, ggml_op_name(t->op), t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], ggml_type_name(t->type));
+                for (int k = 0; k < GGML_MAX_SRC && t->src[k]; ++k) {
+                    fprintf(f, " | %s", t->src[k]->name);
+                }
+                fprintf(f, "\n");
+            }
+            if (f) fclose(f);
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);

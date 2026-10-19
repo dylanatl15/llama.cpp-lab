@@ -1047,6 +1047,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
             case GGML_OP_HC_MIX:
+            case GGML_OP_GDN_PRE:
+            case GGML_OP_MOE_COMBINE:
+            case GGML_OP_GATED_NORM:
+            case GGML_OP_MOE_MAILBOX:
             case GGML_OP_DSV4_HC_POST: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;

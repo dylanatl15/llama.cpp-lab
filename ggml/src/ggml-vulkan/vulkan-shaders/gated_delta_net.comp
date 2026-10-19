@@ -32,6 +32,8 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
+    uint cell_stride;
+    uint dst_cell;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -39,8 +41,9 @@ layout(binding = 1) readonly  buffer KBuf     { FLOAT_TYPE data_k[];     };
 layout(binding = 2) readonly  buffer VBuf     { FLOAT_TYPE data_v[];     };
 layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
-layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
+layout(binding = 5)           buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+layout(binding = 7) readonly  buffer IdxBuf   { int        data_idx[];   };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -103,9 +106,13 @@ void main() {
 
     const uint state_size = S_V * S_V;
     // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D.
-    const uint state_in_base       = (seq_id * H + head_id) * state_size;
+    // cache mode: the state is read from cell idx[seq] and the final state is written to cell dst_cell + seq
+    const bool cache_mode          = cell_stride != 0u;
+    const uint state_in_base       = cache_mode ? (uint(data_idx[seq_id]) * cell_stride + head_id * state_size)
+                                                : (seq_id * H + head_id) * state_size;
     // output state layout per slot: same per-(seq,head) offset as the single-slot case.
-    const uint state_out_base      = (seq_id * H + head_id) * state_size;
+    const uint state_out_base      = cache_mode ? ((dst_cell + seq_id) * cell_stride + head_id * state_size)
+                                                : (seq_id * H + head_id) * state_size;
     const uint state_size_per_snap = state_size * H * n_seqs;
 
     FLOAT_TYPE s_shard[ROWS_PER_LANE];
@@ -181,7 +188,11 @@ void main() {
         }
     }
 
-    if (K == 1u) {
+    if (cache_mode) {
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            data_state[state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+        }
+    } else if (K == 1u) {
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
             data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
         }

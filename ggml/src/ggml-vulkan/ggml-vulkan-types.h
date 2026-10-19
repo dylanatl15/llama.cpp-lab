@@ -657,6 +657,8 @@ static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
 class vk_memory_logger;
 
 struct vk_device_struct {
+    // lab: set while pre-recorded command buffers wait for their submit; the pools must not be reset then
+    int deferred_pending = 0;
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
 
@@ -944,8 +946,14 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
+    vk_pipeline pipeline_gdn_pre_f32;
+    vk_pipeline pipeline_lab_mv_iq4_xs;
+    vk_pipeline pipeline_lab_unpack_iq4_xs;
+    vk_pipeline pipeline_moe_combine_f32;
+    vk_pipeline pipeline_gated_norm_f32;
     vk_pipeline pipeline_hc_mix_a_f32;
     vk_pipeline pipeline_hc_mix_b_f32;
+    vk_pipeline pipeline_moe_mailbox_i32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1229,9 +1237,17 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    ggml_backend_buffer_t lab_scratch_buf = nullptr;  // engine-lab: unpacked-weight scratch
+    size_t lab_scratch_size = 0;
+    std::vector<ggml_backend_buffer_t> lab_retired;  // outgrown scratch buffers, freed at cleanup (may still be referenced by recorded work)
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
+    // lab: record the compute buffers of a graph without submitting them, so the CPU can record while the GPU finishes the previous split,
+    // then submit the buffers with the uploads recorded in the meantime placed in front of them
+    struct vk_deferred_submit { ggml_cgraph * cgraph; ggml_tensor * tensor; int idx; bool almost_ready; };
+    bool defer_record {};
+    std::vector<vk_deferred_submit> deferred;
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;

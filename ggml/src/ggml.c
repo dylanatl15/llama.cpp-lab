@@ -1096,6 +1096,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "HC_MIX",
+    "GDN_PRE",
+    "MOE_COMBINE",
+    "GATED_NORM",
+    "MOE_MAILBOX",
 
     "UNARY",
 
@@ -1113,7 +1117,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1212,6 +1216,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "hc_mix(x, gamma, w_down, w_up, w_inject)",
+    "gdn_pre(qkv, cache, conv, alpha, beta, dt, a)",
+    "moe_combine(experts, shexp, gate)",
+    "gated_norm(x, w, z)",
+    "moe_mailbox(ids)",
 
     "unary(x)",
 
@@ -1229,7 +1237,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5935,6 +5943,56 @@ struct ggml_tensor * ggml_rwkv_wkv6(
     return result;
 }
 
+struct ggml_tensor * ggml_gated_delta_net_cache(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * cache,
+        struct ggml_tensor  * idx,
+        int64_t               dst_cell) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(cache->type == GGML_TYPE_F32 && ggml_is_contiguous(cache));
+    GGML_ASSERT(idx->type == GGML_TYPE_I32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
+    GGML_ASSERT(beta->ne[0] == 1);
+    GGML_ASSERT(cache->ne[0] == S_v*S_v*H);
+    GGML_ASSERT(idx->ne[0] >= n_seqs);
+    GGML_ASSERT(dst_cell >= 0 && dst_cell + n_seqs <= cache->ne[1]);
+
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 1, 1);               // cache mode
+    ggml_set_op_params_i32(result, 2, (int32_t) dst_cell);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = cache;
+    result->src[6] = idx;
+
+    return result;
+}
+
 // ggml_gated_linear_attn
 
 struct ggml_tensor * ggml_gated_linear_attn(
@@ -6619,6 +6677,125 @@ struct ggml_tensor * ggml_hc_mix(
     result->src[2] = w_down;
     result->src[3] = w_up;
     result->src[4] = w_inject;
+
+    return result;
+}
+
+// ggml_gdn_pre
+
+struct ggml_tensor * ggml_gdn_pre(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * qkv,
+        struct ggml_tensor  * cache,
+        struct ggml_tensor  * conv,
+        struct ggml_tensor  * alpha,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * dt,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * idx,
+        int64_t               dst_cell,
+        int64_t               n_norm,
+        float                 eps) {
+    const int64_t C = qkv->ne[0];
+    const int64_t H = alpha->ne[0];
+
+    GGML_ASSERT(qkv->type == GGML_TYPE_F32 && cache->type == GGML_TYPE_F32 && conv->type == GGML_TYPE_F32);
+    GGML_ASSERT(alpha->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32 && dt->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32);
+    GGML_ASSERT(idx->type == GGML_TYPE_I32 && idx->ne[0] >= 1);
+    GGML_ASSERT(C % 128 == 0 && n_norm % 128 == 0 && n_norm <= C);
+    GGML_ASSERT(ggml_nelements(qkv) == C);
+    GGML_ASSERT(conv->ne[0] == 4 && conv->ne[1] == C);
+    GGML_ASSERT(cache->ne[0] == 3*C && dst_cell >= 0 && dst_cell < cache->ne[1]);
+    GGML_ASSERT(ggml_nelements(alpha) == H && ggml_nelements(beta) == H && ggml_nelements(dt) == H && ggml_nelements(a) == H);
+    GGML_ASSERT(H <= 64);
+    GGML_ASSERT(ggml_is_contiguous(qkv) && ggml_is_contiguous(conv) && ggml_is_contiguous(alpha) && ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(dt) && ggml_is_contiguous(a));
+    GGML_ASSERT(cache->nb[0] == sizeof(float) && cache->nb[1] == (size_t) (3*C)*sizeof(float));
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C + 128);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) dst_cell);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_norm);
+    ggml_set_op_params_f32(result, 2, eps);
+
+    result->op     = GGML_OP_GDN_PRE;
+    result->src[0] = qkv;
+    result->src[1] = cache;
+    result->src[2] = conv;
+    result->src[3] = alpha;
+    result->src[4] = beta;
+    result->src[5] = dt;
+    result->src[6] = a;
+    result->src[7] = idx;
+
+    return result;
+}
+
+// ggml_moe_combine
+
+struct ggml_tensor * ggml_moe_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * experts,
+        struct ggml_tensor  * shexp,
+        struct ggml_tensor  * gate) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && ggml_is_contiguous(experts) && experts->ne[3] == 1);
+    GGML_ASSERT((shexp == NULL) == (gate == NULL));
+    if (shexp) {
+        GGML_ASSERT(shexp->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(shexp) && ggml_is_contiguous(gate));
+        GGML_ASSERT(ggml_nelements(shexp) == experts->ne[0]*experts->ne[2] && ggml_nelements(gate) == experts->ne[2]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, experts->ne[0], experts->ne[2]);
+
+    result->op     = GGML_OP_MOE_COMBINE;
+    result->src[0] = experts;
+    result->src[1] = shexp;
+    result->src[2] = gate;
+
+    return result;
+}
+
+// ggml_gated_norm
+
+struct ggml_tensor * ggml_gated_norm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * z,
+        float                 eps) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && z->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(x, z) && ggml_nelements(w) == x->ne[0]);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && ggml_is_contiguous(z) && ggml_is_contiguous(w));
+    // rows of x are contiguous in dim 0 only; the row strides are free but must be dense in dim 1 (checked by the backends)
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
+
+    ggml_set_op_params_f32(result, 0, eps);
+
+    result->op     = GGML_OP_GATED_NORM;
+    result->src[0] = x;
+    result->src[1] = w;
+    result->src[2] = z;
+
+    return result;
+}
+
+// ggml_moe_mailbox
+
+struct ggml_tensor * ggml_moe_mailbox(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        volatile int32_t    * mailbox) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids));
+    GGML_ASSERT(ggml_nelements(ids) <= 32);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, ids);
+    int64_t ptr = (int64_t) (intptr_t) mailbox;
+    memcpy(result->op_params, &ptr, sizeof(ptr));
+
+    result->op     = GGML_OP_MOE_MAILBOX;
+    result->src[0] = ids;
 
     return result;
 }

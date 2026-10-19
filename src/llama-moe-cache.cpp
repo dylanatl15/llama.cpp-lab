@@ -565,6 +565,29 @@ struct llama_moe_cache::impl {
         return l.slot_map;
     }
 
+    ggml_backend_buffer_ptr mb_buf;
+    volatile int32_t * mb_ptr = nullptr;
+    bool mb_tried = false;
+    static constexpr int MB_STRIDE = 32; // int32 per layer, 128 bytes
+
+    volatile int32_t * get_mailbox(int32_t il, int64_t n_tokens, int64_t n_used) {
+        if (getenv("ENGINE_LAB_NO_MAILBOX") || n_tokens != 1 || n_used > MB_STRIDE || get_slot_map(il, n_tokens, n_used) == nullptr) {
+            return nullptr;
+        }
+        if (!mb_tried) {
+            mb_tried = true;
+            ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(devices[0].backend));
+            if (host != nullptr) {
+                mb_buf.reset(ggml_backend_buft_alloc_buffer(host, layers.size()*MB_STRIDE*sizeof(int32_t)));
+                if (mb_buf) {
+                    mb_ptr = (volatile int32_t *) ggml_backend_buffer_get_base(mb_buf.get());
+                    for (size_t i = 0; i < layers.size()*MB_STRIDE; ++i) { mb_ptr[i] = -1; }
+                }
+            }
+        }
+        return mb_ptr != nullptr ? mb_ptr + (size_t) il*MB_STRIDE : nullptr;
+    }
+
     ggml_tensor * get_miss_ids(int32_t il, int64_t n_tokens, int64_t n_used) const {
         if (!hybrid || miss_t == nullptr || n_tokens != 1 || n_used != n_expert_used || get_slot_map(il, n_tokens, n_used) == nullptr) {
             return nullptr;
@@ -722,6 +745,7 @@ struct llama_moe_cache::impl {
     }
 
     double t_read = 0, t_plan = 0, t_up = 0, t_gap = 0, t_memcpy = 0, last_end = 0; size_t n_copy_calls = 0, n_up_calls = 0; size_t d_calls = 0; double d_read = 0, d_up = 0, d_gap = 0, d_memcpy = 0; size_t d_bytes = 0;
+    size_t mb_polls = 0, mb_fallbacks = 0;
     static double now_us() { return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
@@ -760,8 +784,35 @@ struct llama_moe_cache::impl {
         const double t0 = now_us();
         const double gap = last_end > 0 ? t0 - last_end : 0;
         ids.resize(ggml_nelements(sel));
-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
-        ggml_backend_synchronize(backend);
+        volatile int32_t * mb = nullptr;
+        {
+            const ggml_tensor * mbn = sel->view_src ? sel->view_src : sel;
+            if (mbn->op == GGML_OP_MOE_MAILBOX) {
+                int64_t p; memcpy(&p, mbn->op_params, sizeof(p));
+                mb = (volatile int32_t *) (intptr_t) p;
+            }
+        }
+        bool polled = false;
+        if (mb != nullptr) {
+            // the GPU publishes the ids as soon as they are selected, the rest of the split keeps running while the CPU plans
+            const size_t n = ids.size();
+            for (size_t spin = 0; !polled; ++spin) {
+                size_t k = 0;
+                while (k < n && mb[k] >= 0) { ++k; }
+                if (k == n) {
+                    for (size_t j = 0; j < n; ++j) { ids[j] = mb[j]; mb[j] = -1; }
+                    polled = true;
+                } else if ((spin & 0xfff) == 0xfff && now_us() - t0 > 50000) {
+                    break;
+                }
+            }
+            if (polled) { mb_polls++; }
+        }
+        if (!polled) {
+            ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+            ggml_backend_synchronize(backend);
+            if (mb != nullptr) { for (size_t j = 0; j < ids.size(); ++j) { mb[j] = -1; } mb_fallbacks++; }
+        }
 
         const double t1 = now_us();
         if (!stg_tried) {
@@ -840,7 +891,7 @@ struct llama_moe_cache::impl {
         size_t stg_off = stg_map;
         double mc = 0;
         if (stg_ptr != nullptr) { ensure_pool(); }
-        inflight[0] = inflight[1] = false; pos[0] = pos[1] = 0; // the readback above synchronized the backend
+        inflight[0] = inflight[1] = false; pos[0] = pos[1] = 0; // the readback synchronized the backend, or the ids were published after the uploads of the previous layer completed
         jobs.clear();
         struct up_t { ggml_tensor * bank; const uint8_t * host; size_t off, n; };
         std::vector<up_t> ups;
@@ -905,6 +956,7 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, uploaded = %.2f MiB\n",
                 name, st.hits, st.misses, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
         };
+        if (mb_polls || mb_fallbacks) LLAMA_LOG_INFO("llama_moe_cache: mailbox: %zu polled, %zu fell back to readback\n", mb_polls, mb_fallbacks);
         if (n_copy_calls) LLAMA_LOG_INFO("llama_moe_cache: timing: %zu copy calls, readback+sync %.1f us/call, plan %.1f us/call, upload-submit %.1f us/call, %zu upload calls\n", n_copy_calls, t_read/n_copy_calls, t_plan/n_copy_calls, t_up/n_copy_calls, n_up_calls);
         if (bu_calls) LLAMA_LOG_INFO("llama_moe_cache: big uploads: %zu chunks, %.1f MiB, memcpy %.2f s, submit %.2f s, sync %.2f s (%zu syncs)\n", bu_calls, bu_bytes/1048576.0, bu_mc/1e6, bu_sub/1e6, bu_sync/1e6, bu_syncs);
         if (d_calls) LLAMA_LOG_INFO("llama_moe_cache: decode(1 tok): %zu calls, gap(gpu compute+cpu) %.1f us, readback+sync %.1f us, upload %.1f us (memcpy %.1f us), %.2f MiB/call\n", d_calls, d_gap/d_calls, d_read/d_calls, d_up/d_calls, d_memcpy/d_calls, d_bytes/1048576.0/d_calls);
@@ -925,6 +977,10 @@ llama_moe_cache::~llama_moe_cache() = default;
 
 ggml_backend_t llama_moe_cache::backend(int32_t il) const {
     return pimpl->backend(il);
+}
+
+volatile int32_t * llama_moe_cache::get_mailbox(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+    return pimpl->get_mailbox(il, n_tokens, n_expert_used);
 }
 
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
