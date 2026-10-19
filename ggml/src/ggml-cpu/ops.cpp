@@ -9,6 +9,7 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <vector>
 #include <cfloat>
 #include <cmath>
 
@@ -11626,6 +11627,94 @@ void ggml_compute_forward_dsv4_hc_pre(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_hc_mix
+
+void ggml_compute_forward_hc_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * gamma    = dst->src[1];
+    const ggml_tensor * w_down   = dst->src[2];
+    const ggml_tensor * w_up     = dst->src[3];
+    const ggml_tensor * w_inject = dst->src[4];
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t lo_dim = w_down->ne[1];
+    const int64_t n      = n_embd*hc;
+    const float   eps    = ggml_get_op_params_f32(dst, 0);
+
+    float * out    = (float *) dst->data;
+    float * mixed  = out;
+    float * inject = out + n_embd;
+    float * lo     = inject + hc;
+    float * rstd   = lo + lo_dim;
+
+    const float * xf = (const float *) x->data;
+    const float * gf = (const float *) gamma->data;
+
+    std::vector<float> xn(n);
+    for (int64_t s = 0; s < hc; ++s) {
+        double q = 0.0;
+        for (int64_t i = 0; i < n_embd; ++i) {
+            q += (double) xf[s*n_embd + i]*xf[s*n_embd + i];
+        }
+        rstd[s] = 1.0f/sqrtf((float) (q/n_embd) + eps);
+        for (int64_t i = 0; i < n_embd; ++i) {
+            xn[s*n_embd + i] = xf[s*n_embd + i]*rstd[s]*gf[s*n_embd + i];
+        }
+    }
+
+    auto dot_bf16 = [](const ggml_bf16_t * w, const float * v, int64_t len) {
+        double acc = 0.0;
+        for (int64_t k = 0; k < len; ++k) {
+            acc += (double) GGML_BF16_TO_FP32(w[k])*v[k];
+        }
+        return (float) acc;
+    };
+
+    // Vulkan stage scratch: Q[s] = sum x^2, P[row][s] = sum_i x*gamma*w (un-normalized partials)
+    float * qsc = rstd + hc;
+    float * psc = qsc + hc;
+    for (int64_t s = 0; s < hc; ++s) {
+        double q = 0.0;
+        for (int64_t i = 0; i < n_embd; ++i) {
+            q += (double) xf[s*n_embd + i]*xf[s*n_embd + i];
+        }
+        qsc[s] = (float) q;
+    }
+    for (int64_t r = 0; r < lo_dim + hc; ++r) {
+        const ggml_bf16_t * w = (const ggml_bf16_t *) (r < lo_dim ? w_down->data : w_inject->data) + (r < lo_dim ? r : r - lo_dim)*n;
+        for (int64_t s = 0; s < hc; ++s) {
+            double acc = 0.0;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                acc += (double) GGML_BF16_TO_FP32(w[s*n_embd + i])*xf[s*n_embd + i]*gf[s*n_embd + i];
+            }
+            psc[r*hc + s] = (float) acc;
+        }
+    }
+
+    for (int64_t j = 0; j < lo_dim; ++j) {
+        const float v = dot_bf16((const ggml_bf16_t *) w_down->data + j*n, xn.data(), n)/(float) hc;
+        lo[j] = v/(1.0f + expf(-v));
+    }
+    for (int64_t s = 0; s < hc; ++s) {
+        inject[s] = dot_bf16((const ggml_bf16_t *) w_inject->data + s*n, xn.data(), n);
+    }
+    for (int64_t i = 0; i < n_embd; ++i) {
+        float acc = 0.0f;
+        for (int64_t s = 0; s < hc; ++s) {
+            const float g = dot_bf16((const ggml_bf16_t *) w_up->data + (s*n_embd + i)*lo_dim, lo, lo_dim);
+            acc += xn[s*n_embd + i]/(1.0f + expf(-g));
+        }
+        mixed[i] = acc/(float) hc;
     }
 }
 

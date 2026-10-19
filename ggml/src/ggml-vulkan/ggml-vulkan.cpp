@@ -3610,6 +3610,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
 
+    if (device->subgroup_arithmetic && device->subgroup_basic && device->subgroup_require_full_support) {
+        ggml_vk_create_pipeline(device, device->pipeline_hc_mix_a_f32, "hc_mix_a_f32", hc_mix_a_f32_len, hc_mix_a_f32_data, "main", 5, sizeof(vk_op_hc_mix_push_constants), {1, 1, 1}, { device->subgroup_size }, 1, true, true, device->subgroup_size);
+        ggml_vk_create_pipeline(device, device->pipeline_hc_mix_b_f32, "hc_mix_b_f32", hc_mix_b_f32_len, hc_mix_b_f32_data, "main", 4, sizeof(vk_op_hc_mix_push_constants), {1, 1, 1}, {}, 1, true);
+    }
+
     for (auto &s : device->pipeline_solve_tri_f32) {
         const vk_solve_tri_pipeline_state &state = s.first;
 
@@ -7260,6 +7265,56 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     init_pushconst_tensor_offsets(ctx, pc, x, weights, nullptr, nullptr, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, w_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+}
+
+void ggml_vk_hc_mix(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    VK_LOG_DEBUG("ggml_vk_hc_mix(" << dst << ")");
+
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * gamma    = dst->src[1];
+    const ggml_tensor * w_down   = dst->src[2];
+    const ggml_tensor * w_up     = dst->src[3];
+    const ggml_tensor * w_inject = dst->src[4];
+
+    vk_pipeline pa = ctx->device->pipeline_hc_mix_a_f32;
+    vk_pipeline pb = ctx->device->pipeline_hc_mix_b_f32;
+    GGML_ASSERT(pa != nullptr && pb != nullptr);
+
+    const uint32_t n_embd = (uint32_t)x->ne[0];
+    const uint32_t lo_dim = (uint32_t)w_down->ne[1];
+    const uint32_t hc     = (uint32_t)x->ne[1];
+
+    ggml_pipeline_request_descriptor_sets(ctx, pa, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, pb, 1);
+
+    const vk_subbuffer x_buf  = ggml_vk_tensor_subbuffer(ctx, x,        true);
+    const vk_subbuffer g_buf  = ggml_vk_tensor_subbuffer(ctx, gamma,    true);
+    const vk_subbuffer wd_buf = ggml_vk_tensor_subbuffer(ctx, w_down,   true);
+    const vk_subbuffer wi_buf = ggml_vk_tensor_subbuffer(ctx, w_inject, true);
+    const vk_subbuffer wu_buf = ggml_vk_tensor_subbuffer(ctx, w_up,     true);
+    const vk_subbuffer o_buf  = ggml_vk_tensor_subbuffer(ctx, dst,      true);
+
+    vk_op_hc_mix_push_constants pc = {
+        n_embd, lo_dim,
+        (uint32_t)(get_misalign_bytes(ctx, x)        / 4),
+        (uint32_t)(get_misalign_bytes(ctx, gamma)    / 4),
+        (uint32_t)(get_misalign_bytes(ctx, w_down)   / 4),
+        (uint32_t)(get_misalign_bytes(ctx, w_inject) / 4),
+        (uint32_t)(get_misalign_bytes(ctx, w_up)     / 4),
+        (uint32_t)(get_misalign_bytes(ctx, dst)      / 4),
+        ggml_get_op_params_f32(dst, 0),
+        1.0f / (float) hc,
+        256 / ctx->device->subgroup_size,
+    };
+
+    static const int lab_stage = getenv("ENGINE_LAB_HCMIX_STAGE") ? atoi(getenv("ENGINE_LAB_HCMIX_STAGE")) : 0; // profiling: 1 = A only, 2 = B only
+    if (lab_stage != 2) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pa, { x_buf, g_buf, wd_buf, wi_buf, o_buf }, pc, { (lo_dim + hc + pc.rows_per_wg - 1) / pc.rows_per_wg, hc, 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    if (lab_stage != 1) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pb, { x_buf, g_buf, wu_buf, o_buf }, pc, { n_embd / 8, 1, 1 });
+    }
 }
 
 void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * residual, const ggml_tensor * post, const ggml_tensor * comb, ggml_tensor * dst, const ggml_tensor * gate_scale_in) {
@@ -12708,6 +12763,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         ggml_vk_dsv4_hc_post(ctx, compute_ctx, src0, src1, src2, src3, node);
 
         break;
+    case GGML_OP_HC_MIX:
+        ggml_vk_hc_mix(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_MEAN:
         ggml_vk_mean(ctx, compute_ctx, src0, node);
 
@@ -15970,6 +16029,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return true;
             }
+        case GGML_OP_HC_MIX:
+            return device->pipeline_hc_mix_a_f32 != nullptr && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[1] == 4 &&
+                   op->src[2]->type == GGML_TYPE_BF16 && op->src[0]->ne[0] == 2560 && op->src[2]->ne[1] == 320 &&
+                   (256 % device->subgroup_size) == 0 && (1280 % device->subgroup_size) == 0 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[2]);
         case GGML_OP_SOLVE_TRI:
             {
                 if (op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32) {

@@ -175,6 +175,20 @@ struct vk_op_dsv4_hc_comb_push_constants {
     uint32_t n_iter;
 };
 
+struct vk_op_hc_mix_push_constants {
+    uint32_t n_embd;
+    uint32_t lo_dim;
+    uint32_t x_off;
+    uint32_t g_off;
+    uint32_t wd_off;
+    uint32_t wi_off;
+    uint32_t wu_off;
+    uint32_t o_off;
+    float eps;
+    float inv_hc;
+    uint32_t rows_per_wg;
+};
+
 struct vk_op_dsv4_hc_pre_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;

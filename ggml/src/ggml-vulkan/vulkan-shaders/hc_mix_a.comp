@@ -1,0 +1,122 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// hc_mix, stage A (Flash-Next shape: n_embd 2560, lo 320, hc 4).
+//
+// The hc_mix op computes, for one token, the grouped RMSNorm of the 4 residual streams, the two small
+// bf16 projections around the silu bottleneck, the per-element sigmoid gate and the mean over the streams.
+// Both projections read bf16 weights that are far larger than the activations, so stages are split to
+// stream the weights once and cache the activations:
+//
+// Stage A: workgroup (g, s) owns stream s and `rows_per_wg` (one per subgroup) rows of w_down / w_inject.
+// It stages x*gamma of its stream slice in LDS once and every subgroup dots one weight row slice with it.
+//   P[row][s] = sum_i x[i,s]*gamma[i,s]*w[row, s*n_embd + i]       (rows: lo_dim of w_down, then hc of w_inject)
+//   Q[s]      = sum_i x[i,s]^2
+// Stage B combines these into rstd, lo and inject.
+
+layout(constant_id = 0) const uint SG_SIZE = 64;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_embd;
+    uint lo_dim;
+    uint x_off;
+    uint g_off;
+    uint wd_off;
+    uint wi_off;
+    uint wu_off;
+    uint o_off;
+    float eps;
+    float inv_hc;
+    uint rows_per_wg;
+};
+
+layout(binding = 0, std430) readonly buffer X  { float data_x[]; };
+layout(binding = 1, std430) readonly buffer G  { float data_g[]; };
+layout(binding = 2, std430) readonly buffer WD { uint  data_wd[]; };
+layout(binding = 3, std430) readonly buffer WI { uint  data_wi[]; };
+layout(binding = 4, std430) buffer O           { float data_o[]; };
+
+#define N_EMBD 2560
+#define LO     320
+#define HC     4
+#define HALF_N (N_EMBD / 2)
+
+// out layout (floats): mixed[N_EMBD] inject[HC] lo[LO] rstd[HC] Q[HC] P[(LO+HC)*HC]
+const uint O_Q = N_EMBD + HC + LO + HC;
+const uint O_P = O_Q + HC;
+
+shared vec2  xg[HALF_N];
+shared float qsh[32];
+
+#define NU (HALF_N / 64)   // uints per lane (subgroup size 64)
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint s    = gl_WorkGroupID.y;
+    const uint g    = gl_WorkGroupID.x;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint row  = g * rows_per_wg + gl_SubgroupID;
+
+    // Issue the weight loads first so their latency overlaps the x/gamma staging below.
+    uint wv[HALF_N / 32];
+    const uint nu = HALF_N / SG_SIZE;
+    if (row < LO + HC) {
+        if (row < LO) {
+            const uint base = wd_off + row * (HC * HALF_N) + s * HALF_N + lane;
+            [[unroll]] for (uint k = 0; k < HALF_N / 32; ++k) {
+                if (k < nu) wv[k] = data_wd[base + k * SG_SIZE];
+            }
+        } else {
+            const uint base = wi_off + (row - LO) * (HC * HALF_N) + s * HALF_N + lane;
+            [[unroll]] for (uint k = 0; k < HALF_N / 32; ++k) {
+                if (k < nu) wv[k] = data_wi[base + k * SG_SIZE];
+            }
+        }
+    }
+
+    float q = 0.0f;
+    [[unroll]] for (uint k = 0; k < HALF_N / 256 + 1; ++k) {
+        const uint u = tid + k * 256;
+        if (u < HALF_N) {
+            const uint e = x_off + s * N_EMBD + 2 * u;
+            const uint ge = g_off + s * N_EMBD + 2 * u;
+            const vec2 x = vec2(data_x[e], data_x[e + 1]);
+            xg[u] = x * vec2(data_g[ge], data_g[ge + 1]);
+            q = fma(x.x, x.x, fma(x.y, x.y, q));
+        }
+    }
+    q = subgroupAdd(q);
+    if (subgroupElect()) {
+        qsh[gl_SubgroupID] = q;
+    }
+    barrier();
+
+    if (row < LO + HC) {
+        float p = 0.0f;
+        [[unroll]] for (uint k = 0; k < HALF_N / 32; ++k) {
+            if (k < nu) {
+                const vec2 a = xg[lane + k * SG_SIZE];
+                p = fma(a.x, uintBitsToFloat(wv[k] << 16), p);
+                p = fma(a.y, uintBitsToFloat(wv[k] & 0xffff0000u), p);
+            }
+        }
+        p = subgroupAdd(p);
+        if (subgroupElect()) {
+            data_o[o_off + O_P + row * HC + s] = p;
+        }
+    }
+
+    if (g == 0 && tid == 0) {
+        float qs = 0.0f;
+        for (uint i = 0; i < gl_NumSubgroups; ++i) {
+            qs += qsh[i];
+        }
+        data_o[o_off + O_Q + s] = qs;
+    }
+}

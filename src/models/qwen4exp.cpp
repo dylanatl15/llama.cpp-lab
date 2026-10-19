@@ -322,6 +322,46 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     const int64_t hc_dim = hc * n_embd;
     const int64_t nt     = x->ne[2];
 
+    // lab numerics check: also build the unfused chain and expose both for comparison (see examples/eval-callback/hccheck.cpp)
+    static const bool lab_check = getenv("ENGINE_LAB_HCMIX_CHECK") != nullptr;
+    static thread_local bool lab_force_unfused = false;
+    static thread_local bool lab_in_check = false;
+    if (lab_check && !lab_in_check && cparams.fused_hc_mix && il >= 0 && nt == 1 && inject) {
+        lab_in_check = true;
+        ggml_tensor * inj_fused = nullptr;
+        ggml_tensor * mixed_fused = build_hc_mix(x, w_norm, w_down, w_up, w_inject, &inj_fused, il);
+        ggml_tensor * ref_inj = nullptr;
+        lab_force_unfused = true;
+        ggml_tensor * ref_mixed = build_hc_mix(x, w_norm, w_down, w_up, w_inject, &ref_inj, il);
+        lab_force_unfused = false;
+        lab_in_check = false;
+        ggml_format_name(ref_mixed, "ref_mixed-%d", il);
+        ggml_format_name(ref_inj,   "ref_inject-%d", il);
+        ggml_set_output(ref_mixed);
+        ggml_set_output(ref_inj);
+        ggml_set_output(mixed_fused);
+        ggml_set_output(inj_fused);
+        ggml_build_forward_expand(gf, ref_mixed);
+        ggml_build_forward_expand(gf, ref_inj);
+        *inject = inj_fused;
+        return mixed_fused;
+    }
+
+    // single-token decode: the whole mix is two dispatches on backends that have the op
+    if (!lab_force_unfused && cparams.fused_hc_mix && il >= 0 && nt == 1 && inject && loras->empty() &&
+            w_down->type == GGML_TYPE_BF16 && w_up->type == GGML_TYPE_BF16 && w_inject->type == GGML_TYPE_BF16 &&
+            w_norm->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && hc == 4) {
+        ggml_tensor * packed = ggml_hc_mix(ctx0, x, w_norm, w_down, w_up, w_inject, hparams.f_norm_rms_eps);
+        res->add_fused_node({LLM_FUSED_OP_HC_MIX, packed, il});
+        cb(packed, "hc_mix", il);
+        const size_t fs = ggml_type_size(GGML_TYPE_F32);
+        ggml_tensor * mixed_v = ggml_view_2d(ctx0, packed, n_embd, 1, n_embd*fs, 0);
+        *inject = ggml_view_2d(ctx0, packed, hc, 1, hc*fs, n_embd*fs);
+        cb(mixed_v, "hc_mixed", il);
+        cb(*inject, "hc_inject", il);
+        return mixed_v;
+    }
+
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [n_embd, hc] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), w_norm);

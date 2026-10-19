@@ -585,6 +585,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_HC_MIX,
 
         GGML_OP_UNARY,
 
@@ -2731,6 +2732,26 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // hc_mix (Qwen3.8-Flash-Next decode, one token): the whole hyper-connection mix of one layer half in one op.
+    //   x [n_embd, hc, 1] f32 residual streams, gamma [n_embd, hc] f32, w_down [hc*n_embd, lo] bf16,
+    //   w_up [lo, hc*n_embd] bf16, w_inject [hc*n_embd, hc] bf16
+    //   xn[i, s]   = x[i, s]*rsqrt(mean_i(x[:, s]^2) + eps)*gamma[i, s]
+    //   lo         = silu(w_down*xn / hc)
+    //   gate       = w_up*lo
+    //   mixed[i]   = sum_s xn[i, s]*sigmoid(gate[s*n_embd + i]) / hc
+    //   inject[s]  = w_inject*xn
+    // The result is one packed f32 vector [n_embd + hc + lo + hc]: mixed, inject, then lo and the per-stream
+    // rstd as scratch. ggml_hc_mix_{mixed,inject} are views onto it.
+    //
+    GGML_API struct ggml_tensor * ggml_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * w_down,
+            struct ggml_tensor  * w_up,
+            struct ggml_tensor  * w_inject,
+            float                 eps);
 
     // custom operators
 

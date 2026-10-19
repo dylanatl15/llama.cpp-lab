@@ -1,0 +1,111 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// hc_mix, stage B (see hc_mix_a.comp). One workgroup per 8 hidden positions.
+// Prologue: finish the A partials into rstd, lo = silu(w_down*xn / hc) and (workgroup 0) inject.
+// Then for each position and stream the gate is dot(w_up row, lo), 8 lanes per row, and
+//   out[i] = inv_hc * sum_s x[i,s]*rstd_s*gamma[i,s] * sigmoid(gate_s)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_embd;
+    uint lo_dim;
+    uint x_off;
+    uint g_off;
+    uint wd_off;
+    uint wi_off;
+    uint wu_off;
+    uint o_off;
+    float eps;
+    float inv_hc;
+    uint rows_per_wg;
+};
+
+layout(binding = 0, std430) readonly buffer X  { float data_x[]; };
+layout(binding = 1, std430) readonly buffer G  { float data_g[]; };
+layout(binding = 2, std430) readonly buffer WU { uint  data_wu[]; };
+layout(binding = 3, std430) buffer O           { float data_o[]; };
+
+#define N_EMBD 2560
+#define LO     320
+#define HC     4
+#define POS_PER_WG 8
+
+const uint O_INJ  = N_EMBD;
+const uint O_LO   = N_EMBD + HC;
+const uint O_RSTD = O_LO + LO;
+const uint O_Q    = O_RSTD + HC;
+const uint O_P    = O_Q + HC;
+
+shared vec2  lo_s[LO / 2];
+shared float red[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint wg  = gl_WorkGroupID.x;
+
+    float rstd[HC];
+    [[unroll]] for (uint s = 0; s < HC; ++s) {
+        rstd[s] = inversesqrt(data_o[o_off + O_Q + s] / float(N_EMBD) + eps);
+    }
+
+    for (uint j = tid; j < LO; j += 256) {
+        const vec4 p = vec4(data_o[o_off + O_P + j * HC + 0], data_o[o_off + O_P + j * HC + 1],
+                            data_o[o_off + O_P + j * HC + 2], data_o[o_off + O_P + j * HC + 3]);
+        const float v = dot(p, vec4(rstd[0], rstd[1], rstd[2], rstd[3])) * inv_hc;
+        const float l = v / (1.0f + exp(-v));
+        lo_s[j >> 1][j & 1] = l;
+        if (wg == 0) {
+            data_o[o_off + O_LO + j] = l;
+        }
+    }
+    if (wg == 0 && tid < HC) {
+        const uint j = LO + tid;
+        const vec4 p = vec4(data_o[o_off + O_P + j * HC + 0], data_o[o_off + O_P + j * HC + 1],
+                            data_o[o_off + O_P + j * HC + 2], data_o[o_off + O_P + j * HC + 3]);
+        data_o[o_off + O_INJ + tid] = dot(p, vec4(rstd[0], rstd[1], rstd[2], rstd[3]));
+    }
+    if (wg == 0 && tid == 0) {
+        [[unroll]] for (uint s = 0; s < HC; ++s) {
+            data_o[o_off + O_RSTD + s] = rstd[s];
+        }
+    }
+    barrier();
+
+    const uint slot   = tid >> 3;
+    const uint lane   = tid & 7;
+    const uint stream = slot & 3;
+    const uint pos    = wg * POS_PER_WG + (slot >> 2);
+    const uint rb     = wu_off + (stream * N_EMBD + pos) * (LO / 2);
+
+    float acc = 0.0f;
+    [[unroll]] for (uint k = 0; k < (LO / 2) / 8; ++k) {
+        const uint u  = lane + k * 8;
+        const uint wv = data_wu[rb + u];
+        const vec2 l  = lo_s[u];
+        acc = fma(l.x, uintBitsToFloat(wv << 16), acc);
+        acc = fma(l.y, uintBitsToFloat(wv & 0xffff0000u), acc);
+    }
+    red[tid] = acc;
+    barrier();
+    [[unroll]] for (uint st = 4; st > 0; st >>= 1) {
+        if (lane < st) {
+            red[tid] += red[tid + st];
+        }
+        barrier();
+    }
+
+    if (lane == 0 && stream == 0) {
+        float r = 0.0f;
+        [[unroll]] for (uint s = 0; s < HC; ++s) {
+            const float gate = red[(tid + 8 * s)];
+            const uint  e    = s * N_EMBD + pos;
+            const float xn   = data_x[x_off + e] * rstd[s] * data_g[g_off + e];
+            r = fma(xn, 1.0f / (1.0f + exp(-gate)), r);
+        }
+        data_o[o_off + pos] = r * inv_hc;
+    }
+}

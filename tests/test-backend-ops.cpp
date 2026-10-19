@@ -4483,6 +4483,67 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 };
 
+struct test_hc_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t lo;
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, lo);
+    }
+
+    test_hc_mix(int64_t n_embd = 2560, int64_t lo = 320) : n_embd(n_embd), lo(lo) {}
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc = 4;
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(gamma, "gamma");
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, n_embd*hc, lo);
+        ggml_set_name(w_down, "w_down");
+        ggml_tensor * w_up = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, lo, n_embd*hc);
+        ggml_set_name(w_up, "w_up");
+        ggml_tensor * w_inject = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, n_embd*hc, hc);
+        ggml_set_name(w_inject, "w_inject");
+
+        ggml_tensor * out = ggml_hc_mix(ctx, x, gamma, w_down, w_up, w_inject, 1e-6f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            float lo_v = -1.0f, hi_v = 1.0f;
+            if (name == "x") { lo_v = -2.0f; hi_v = 2.0f; }
+            if (name == "gamma") { lo_v = 0.5f; hi_v = 1.5f; }
+            if (name[0] == 'w') {
+                const float a = 3.0f/sqrtf((float) t->ne[0]);
+                lo_v = -a; hi_v = a;
+            }
+            std::uniform_real_distribution<float> dist(lo_v, hi_v);
+            std::vector<float> data(ggml_nelements(t));
+            for (float & v : data) {
+                v = dist(rng);
+            }
+            if (t->type == GGML_TYPE_BF16) {
+                std::vector<ggml_bf16_t> b(data.size());
+                for (size_t i = 0; i < data.size(); ++i) {
+                    b[i] = ggml_fp32_to_bf16(data[i]);
+                }
+                ggml_backend_tensor_set(t, b.data(), 0, b.size()*sizeof(ggml_bf16_t));
+            } else {
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            }
+        }
+    }
+};
+
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -9744,6 +9805,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_comb(n_tokens, 20));
     }
 
+    test_cases.emplace_back(new test_hc_mix());
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 4, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17));
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 4, 257));
