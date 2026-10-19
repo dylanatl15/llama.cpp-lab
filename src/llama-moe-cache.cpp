@@ -29,20 +29,28 @@ struct cpy_pool {
     std::atomic<int> gen{0}, done{0}, next{0};
     std::atomic<bool> quit{false};
     const cpy_job * jobs = nullptr; int njobs = 0; int nw = 0;
+    double spin_us = 3000;
     void start(int n) {
         nw = n;
+        if (const char * e = getenv("ENGINE_LAB_CPY_SPIN_US")) { spin_us = atof(e); }
         for (int i = 0; i < n; ++i) th.emplace_back([this] {
-            int seen = 0; int idle = 0;
+            int seen = 0; int idle = 0; double t_idle = 0;
             while (!quit.load(std::memory_order_relaxed)) {
                 int g = gen.load(std::memory_order_acquire);
                 if (g == seen) {
-                    // spin briefly for low latency during decode, then sleep so an idle server does not burn the cores
-                    if (++idle < 20000) { _mm_pause(); continue; }
-                    syscall(SYS_futex, (int *) &gen, FUTEX_WAIT_PRIVATE, seen, nullptr, nullptr, 0);
-                    idle = 0;
+                    // spin for spin_us after the last job so the next decode layer finds the workers awake, then sleep so an idle server does not burn the cores
+                    if ((++idle & 255) == 1) {
+                        const double t = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                        if (t_idle == 0) t_idle = t;
+                        if (t - t_idle > spin_us) {
+                            syscall(SYS_futex, (int *) &gen, FUTEX_WAIT_PRIVATE, seen, nullptr, nullptr, 0);
+                            idle = 0; t_idle = 0;
+                        }
+                    }
+                    _mm_pause();
                     continue;
                 }
-                idle = 0;
+                idle = 0; t_idle = 0;
                 seen = g; work(); done.fetch_add(1, std::memory_order_release);
             }
         });
@@ -617,7 +625,7 @@ struct llama_moe_cache::impl {
     size_t    pos[2] = {0, 0};
 
     void ensure_pool() {
-        if (!pool_on) { const char * e = getenv("ENGINE_LAB_CPY_THREADS"); int nt = e ? atoi(e) : 3; if (nt > 0) pool.start(nt); pool_on = true; }
+        if (!pool_on) { const char * e = getenv("ENGINE_LAB_CPY_THREADS"); int nt = e ? atoi(e) : 12; if (nt > 0) pool.start(nt); pool_on = true; }
     }
 
     // large uploads (prefill): parallel memcpy into one half of the pinned buffer while the other half is in flight
@@ -662,6 +670,7 @@ struct llama_moe_cache::impl {
         }
         return true;
     }
+    size_t cpy_chunk = getenv("ENGINE_LAB_CPY_CHUNK") ? (size_t) atol(getenv("ENGINE_LAB_CPY_CHUNK")) : (size_t) 64 << 10;
     static constexpr size_t stg_map = 65536; // head of the staging buffer: copy of the slot map
 
     void stg_init(ggml_backend_t backend) {
@@ -846,7 +855,10 @@ struct llama_moe_cache::impl {
                 }
                 const uint8_t * host = (const uint8_t *) w->data + fills[i].expert*expert_size;
                 if (stg_ptr != nullptr && stg_off + n*expert_size <= stg_size) {
-                    jobs.push_back({stg_ptr + stg_off, host, n*expert_size});
+                    // split into chunks so the workers share the copy evenly
+                    for (size_t o = 0; o < n*expert_size; o += cpy_chunk) {
+                        jobs.push_back({stg_ptr + stg_off + o, host + o, std::min(cpy_chunk, n*expert_size - o)});
+                    }
                     host = stg_ptr + stg_off;
                     stg_off += n*expert_size;
                 }
