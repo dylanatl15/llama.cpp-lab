@@ -2892,7 +2892,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         return is_rdna3_or_4 ? 4u : rows;
     };
+    if (const char * e = getenv("ENGINE_LAB_RM_STDQ")) { rm_stdq = atoi(e); }
+    if (const char * e = getenv("ENGINE_LAB_RM_KQ")) { rm_kq = atoi(e); }
     uint32_t rm_iq = 2 * rm_kq;
+    if (const char * e = getenv("ENGINE_LAB_RM_IQ")) { rm_iq = atoi(e); }
 
     const bool use_subgroups = device->subgroup_arithmetic;
     // The Imagination proprietary compiler rejects the subgroup-only dequant mul_mat_vec
@@ -13464,8 +13467,11 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     return false;
 }
 
+static std::chrono::steady_clock::time_point lab_t_sync_done;
+static bool lab_sync_seen = false;
 void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
+    struct LabSyncGuard { ~LabSyncGuard() { lab_t_sync_done = std::chrono::steady_clock::now(); lab_sync_seen = true; } } lab_sync_guard;
 
     bool do_transfer = !ctx->compute_ctx.expired();
 
@@ -13712,6 +13718,11 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
 
     auto const &mmid_mul_ok = [&](const ggml_tensor *mmid, const ggml_tensor *mul) {
         const ggml_tensor *scale = mul->src[1];
+        if (getenv("ENGINE_LAB_FUSEDBG")) {
+            fprintf(stderr, "FUSEDBG mmid_mul: same=%d usevec=%d typ=%d/%d contig=%d misalign=%u scale ne=%ld,%ld,%ld,%ld mul ne1=%ld scalename=%s\n",
+                mmid == mul->src[0], ggml_vk_use_mul_mat_vec_id(cgraph, node_idx), mmid->type, scale->type, ggml_is_contiguous(scale),
+                (unsigned) get_misalign_bytes(ctx, scale), (long)scale->ne[0], (long)scale->ne[1], (long)scale->ne[2], (long)scale->ne[3], (long)mul->ne[1], scale->name);
+        }
 
         if (mmid != mul->src[0]) {
             return false;
@@ -14288,13 +14299,36 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph);
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     static const bool lab_t = getenv("ENGINE_LAB_VKT") != nullptr;
+    {
+        static int dumped = 0;
+        static const bool lab_d = getenv("ENGINE_LAB_DUMP") != nullptr;
+        if (lab_d && cgraph->n_nodes < 400 && cgraph->n_nodes > 20 && dumped < 6) {
+            dumped++;
+            fprintf(stderr, "DUMP graph %d: %d nodes\n", dumped, cgraph->n_nodes);
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                const ggml_tensor * n = cgraph->nodes[i];
+                fprintf(stderr, "DUMP %3d %-14s %-10s ne=[%lld,%lld,%lld,%lld] src0=%s[%lld,%lld,%lld] %s\n", i, ggml_op_name(n->op), ggml_type_name(n->type),
+                    (long long)n->ne[0], (long long)n->ne[1], (long long)n->ne[2], (long long)n->ne[3],
+                    n->src[0] ? ggml_type_name(n->src[0]->type) : "-", n->src[0] ? (long long)n->src[0]->ne[0] : 0, n->src[0] ? (long long)n->src[0]->ne[1] : 0, n->src[0] ? (long long)n->src[0]->ne[2] : 0, n->name);
+            }
+        }
+    }
     if (!lab_t) return ggml_backend_vk_graph_compute_impl(backend, cgraph);
-    static double tot = 0; static long n = 0, nodes = 0;
+    static double tot = 0, t_gap = 0, t_gpu = 0; static long n = 0, nodes = 0, n_gpu = 0;
+    static std::chrono::steady_clock::time_point last_ret; static bool have_last_ret = false;
+    bool dec = false;
+    if (cgraph->n_nodes < 400) { for (int i = 0; i < cgraph->n_nodes && i < 40; i++) if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) { dec = cgraph->nodes[i]->ne[1] == 1; break; } }
     auto t0 = std::chrono::steady_clock::now();
+    if (dec && lab_sync_seen && lab_t_sync_done > last_ret && have_last_ret) {
+        t_gpu += std::chrono::duration<double, std::micro>(lab_t_sync_done - last_ret).count(); n_gpu++;
+        t_gap += std::chrono::duration<double, std::micro>(t0 - lab_t_sync_done).count();
+    }
     auto r = ggml_backend_vk_graph_compute_impl(backend, cgraph);
-    if (cgraph->n_nodes < 400) {
-        tot += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(); n++; nodes += cgraph->n_nodes;
-        if (n % 4000 == 0) fprintf(stderr, "VKT: %ld small graphs, %.1f us/graph (cpu record+submit), %.1f nodes/graph, %.2f us/node\n", n, tot/n, (double)nodes/n, tot/nodes);
+    auto t1 = std::chrono::steady_clock::now();
+    if (dec) {
+        last_ret = t1; have_last_ret = true;
+        tot += std::chrono::duration<double, std::micro>(t1 - t0).count(); n++; nodes += cgraph->n_nodes;
+        if (n % 2000 == 0) { fprintf(stderr, "VKT: %ld decode graphs, %.1f nodes/graph | record+submit %.1f us | gpu tail after record %.1f us | host gap sync->next entry %.1f us\n", n, (double)nodes/n, tot/n, n_gpu ? t_gpu/n_gpu : 0.0, n_gpu ? t_gap/n_gpu : 0.0); tot = t_gap = t_gpu = 0; n = nodes = n_gpu = 0; }
     }
     return r;
 }
@@ -14357,6 +14391,7 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
 
+        if (!ctx->compute_ctx.expired()) { ggml_vk_synchronize(ctx); }  // lab: flush pending async uploads (moe cache) so the timestamp pool starts clean
         GGML_ASSERT(ctx->compute_ctx.expired());
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
@@ -14715,6 +14750,14 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+        {
+            static const char * lab_d2 = getenv("ENGINE_LAB_DUMP2");
+            static int lab_d2_graphs = 0; static const ggml_cgraph * lab_d2_last = nullptr;
+            if (lab_d2 && cgraph->n_nodes > 20 && cgraph->n_nodes < 400) {
+                if (lab_d2_last != cgraph) { lab_d2_last = cgraph; lab_d2_graphs++; if (lab_d2_graphs <= 6) fprintf(stderr, "DUMP2 graph %d: %d nodes\n", lab_d2_graphs, cgraph->n_nodes); }
+                if (lab_d2_graphs <= 6 && enqueued) fprintf(stderr, "DUMP2 %3d %-16s fused=%d %s %s\n", i, ggml_op_name(cgraph->nodes[i]->op), (int)ctx->num_additional_fused_ops, fusion_string ? fusion_string : "-", cgraph->nodes[i]->name);
+            }
+        }
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
