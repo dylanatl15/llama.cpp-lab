@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-moe-cache.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
@@ -1298,6 +1299,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             combined = true;
             return ggml_moe_combine(ctx0, experts, ffn_shexp, shexp_gate_raw);
         };
+    }
+
+    static const bool lab_pred = getenv("LAB_PRED") != nullptr;
+    if (lab_pred && moe_cache != nullptr && n_tokens == 1 && il + 1 < (int) model.layers.size() && model.layers[il + 1].ffn_gate_inp != nullptr) {
+        // lab: predict the experts of the next layer from this layer's FFN input
+        if (volatile int32_t * pm = moe_cache->get_pred_mailbox(il + 1, 1, n_expert_used)) {
+            ggml_tensor * lg  = ggml_mul_mat(ctx0, model.layers[il + 1].ffn_gate_inp, cur);
+            ggml_tensor * top = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, lg, n_expert_used));
+            top = ggml_reshape_1d(ctx0, top, ggml_nelements(top));
+            ggml_tensor * mbn = ggml_moe_mailbox(ctx0, top, pm);
+            if (ggml_backend_supports_op(moe_cache->backend(il), mbn)) {
+                ggml_backend_sched_set_tensor_backend(sched, mbn, moe_cache->backend(il));
+                ggml_build_forward_expand(gf, mbn);
+            }
+        }
     }
 
     ggml_tensor * moe_out =

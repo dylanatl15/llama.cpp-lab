@@ -24,6 +24,7 @@ public:
 
     // decode: pinned host mailbox of layer il that the GPU fills with the selected experts (ggml_moe_mailbox), nullptr if not available
     // the copy callback then polls it instead of synchronizing the backend
+    volatile int32_t * get_pred_mailbox(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
     volatile int32_t * get_mailbox(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
 
     // hybrid decode (ENGINE_LAB_HYBRID=1): host tensor [n_expert_used, 1] filled by copy() with the selected experts that are not cached (others -1), nullptr if not applicable

@@ -555,6 +555,7 @@ struct llama_moe_cache::impl {
                 fclose(f);
             }
         }
+        if (pr_calls) { fprintf(stderr, "PRED: calls %zu  recall(all) %.3f  recall(missed) %.3f  (missed %zu of %zu)\n", pr_calls, (double) pr_hit/pr_n, pr_miss ? (double) pr_miss_hit/pr_miss : 0.0, pr_miss, pr_n); }
         log_stats();
     }
 
@@ -584,15 +585,23 @@ struct llama_moe_cache::impl {
             mb_tried = true;
             ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(devices[0].backend));
             if (host != nullptr) {
-                mb_buf.reset(ggml_backend_buft_alloc_buffer(host, layers.size()*MB_STRIDE*sizeof(int32_t)));
+                mb_buf.reset(ggml_backend_buft_alloc_buffer(host, 2*layers.size()*MB_STRIDE*sizeof(int32_t)));
                 if (mb_buf) {
                     mb_ptr = (volatile int32_t *) ggml_backend_buffer_get_base(mb_buf.get());
-                    for (size_t i = 0; i < layers.size()*MB_STRIDE; ++i) { mb_ptr[i] = -1; }
+                    for (size_t i = 0; i < 2*layers.size()*MB_STRIDE; ++i) { mb_ptr[i] = -1; }
                 }
             }
         }
         return mb_ptr != nullptr ? mb_ptr + (size_t) il*MB_STRIDE : nullptr;
     }
+
+    // lab: predicted ids of layer il (published by the graph of layer il-1), same size as the mailbox
+    volatile int32_t * get_pred_mailbox(int32_t il, int64_t n_tokens, int64_t n_used) {
+        volatile int32_t * m = get_mailbox(il, n_tokens, n_used);
+        return m != nullptr ? m + layers.size()*MB_STRIDE : nullptr;
+    }
+
+    size_t pr_n = 0, pr_hit = 0, pr_miss = 0, pr_miss_hit = 0, pr_calls = 0;
 
     ggml_tensor * get_miss_ids(int32_t il, int64_t n_tokens, int64_t n_used) const {
         if (!hybrid || miss_t == nullptr || n_tokens != 1 || n_used != n_expert_used || get_slot_map(il, n_tokens, n_used) == nullptr) {
@@ -889,6 +898,23 @@ struct llama_moe_cache::impl {
             return true;
         }
 
+        if (mb != nullptr && getenv("LAB_PRED")) {
+            volatile int32_t * pm = mb + layers.size()*MB_STRIDE;
+            const size_t n = ids.size();
+            if (pm[0] >= 0) {
+                const int32_t * sm = g.lru.slot_map[il];
+                pr_calls++;
+                for (size_t j = 0; j < n; ++j) {
+                    bool inp = false;
+                    for (size_t k = 0; k < n; ++k) { if (pm[k] == ids[j]) { inp = true; break; } }
+                    const bool miss = sm[ids[j]] < 0;
+                    pr_n++; pr_hit += inp;
+                    if (miss) { pr_miss++; pr_miss_hit += inp; }
+                }
+            }
+            for (size_t k = 0; k < n; ++k) { pm[k] = -1; }
+        }
+
         size_t n_hit = 0;
         if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
@@ -988,6 +1014,10 @@ llama_moe_cache::~llama_moe_cache() = default;
 
 ggml_backend_t llama_moe_cache::backend(int32_t il) const {
     return pimpl->backend(il);
+}
+
+volatile int32_t * llama_moe_cache::get_pred_mailbox(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+    return pimpl->get_pred_mailbox(il, n_tokens, n_expert_used);
 }
 
 volatile int32_t * llama_moe_cache::get_mailbox(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
