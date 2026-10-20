@@ -1095,6 +1095,7 @@ struct vk_submission {
     vk_command_buffer* buffer = nullptr;
     std::vector<vk_semaphore> wait_semaphores;
     std::vector<vk_semaphore> signal_semaphores;
+    uint32_t lab_q = UINT32_MAX; // lab: GPU timestamp slot
 };
 
 typedef std::vector<vk_submission> vk_sequence;

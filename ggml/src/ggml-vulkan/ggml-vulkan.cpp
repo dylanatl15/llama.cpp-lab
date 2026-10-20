@@ -903,6 +903,12 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
 }
 
 static int g_lab_pending = 0; static bool g_lab_started = false;
+// lab: GPU-side per-chunk timestamps (see lab_gt_setup below)
+struct lab_gt_sub_t { uint32_t q0; double t_in, t_out; };
+static uint32_t lab_gt_cap = 0;
+static bool lab_gt_done = false;
+static std::vector<lab_gt_sub_t> lab_gt_subs;
+
 void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
     if (ctx->seqs.empty()) {
         if (fence) {
@@ -975,7 +981,15 @@ void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
         }
     }
 
+    const bool lab_ev = lab_gt_cap && !lab_gt_done;
+    double lab_t_in = 0;
+    if (lab_ev) lab_t_in = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
     ctx->p->q->handle->submit(submit_infos, fence);
+    if (lab_ev) {
+        uint32_t q0 = UINT32_MAX;
+        for (const auto& sequence : ctx->seqs) for (const auto& sub : sequence) if (q0 == UINT32_MAX) q0 = sub.lab_q;
+        lab_gt_subs.push_back({q0, lab_t_in, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count()});
+    }
 
     ctx->seqs.clear();
 }
@@ -4697,6 +4711,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         }
 
         device_extensions.push_back("VK_KHR_16bit_storage");
+        if (getenv("ENGINE_LAB_GT")) { device_extensions.push_back("VK_EXT_calibrated_timestamps"); }
 
 #ifdef GGML_VULKAN_VALIDATE
         device_extensions.push_back("VK_KHR_shader_non_semantic_info");
@@ -5842,6 +5857,61 @@ void ggml_vk_cmd_label_begin(vk::CommandBuffer buf, const char * name) {
     vk_instance.pfn_vkCmdBeginDebugUtilsLabelEXT(buf, reinterpret_cast<VkDebugUtilsLabelEXT *>(&label));
 }
 
+// ---- lab: GPU-side per-chunk timestamps (ENGINE_LAB_GT=<n chunks>) ----
+static uint32_t lab_gt_n = 0;            // chunks recorded
+static bool lab_gt_init = false;
+static vk::QueryPool lab_gt_pool;
+static std::vector<std::pair<uint32_t, double>> lab_gt_graphs; // (chunk idx at graph entry, cpu us)
+
+static void lab_gt_setup(vk_device& device) {
+    if (lab_gt_init) return;
+    lab_gt_init = true;
+    const char * e = getenv("ENGINE_LAB_GT");
+    if (!e) return;
+    lab_gt_cap = (uint32_t) atoi(e);
+    if (lab_gt_cap == 0) return;
+    vk::QueryPoolCreateInfo qi({}, vk::QueryType::eTimestamp, lab_gt_cap * 2);
+    lab_gt_pool = device->device.createQueryPool(qi);
+}
+
+static void lab_gt_flush(vk_device& device) {
+    if (lab_gt_done || lab_gt_n == 0) return;
+    lab_gt_done = true;
+    std::vector<uint64_t> r(lab_gt_n * 2);
+    vk::Result res = device->device.getQueryPoolResults(lab_gt_pool, 0, lab_gt_n * 2, r.size() * 8, r.data(), 8,
+                                                        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+    const char * path = getenv("ENGINE_LAB_GT_OUT");
+    FILE * f = fopen(path ? path : "/tmp/lab_gt.txt", "w");
+    if (!f) return;
+    const double period = device->properties.limits.timestampPeriod; // ns per tick
+    fprintf(f, "# res=%d period_ns=%f n=%u\n", (int) res, period, lab_gt_n);
+    {
+        // map the GPU clock to CLOCK_MONOTONIC (steady_clock)
+        auto pfn = (PFN_vkGetCalibratedTimestampsEXT) device->device.getProcAddr("vkGetCalibratedTimestampsEXT");
+        if (pfn) {
+            VkCalibratedTimestampInfoEXT inf[2] = {};
+            inf[0].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT; inf[0].timeDomain = VK_TIME_DOMAIN_DEVICE_EXT;
+            inf[1].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT; inf[1].timeDomain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT;
+            uint64_t ts[2] = {}, dev = 0;
+            VkResult cr = pfn((VkDevice) device->device, 2, inf, ts, &dev);
+            fprintf(f, "# calib res=%d gpu_us=%.3f mono_us=%.3f\n", (int) cr, ts[0] * period / 1000.0, ts[1] / 1000.0);
+        } else {
+            fprintf(f, "# calib unavailable\n");
+        }
+    }
+    for (auto & s : lab_gt_subs) fprintf(f, "S %u %.1f %.1f\n", s.q0, s.t_in, s.t_out);
+    size_t gi = 0;
+    for (uint32_t i = 0; i < lab_gt_n; i++) {
+        while (gi < lab_gt_graphs.size() && lab_gt_graphs[gi].first <= i) {
+            fprintf(f, "G %u %.1f\n", lab_gt_graphs[gi].first, lab_gt_graphs[gi].second);
+            gi++;
+        }
+        fprintf(f, "C %u %.1f %.1f\n", i, r[2*i] * period / 1000.0, r[2*i+1] * period / 1000.0);
+    }
+    fclose(f);
+    fprintf(stderr, "lab_gt: wrote %u chunks\n", lab_gt_n);
+}
+
 void ggml_vk_ctx_end(vk_context& ctx) {
     VK_LOG_DEBUG("ggml_vk_ctx_end(" << ctx << ", " << ctx->seqs.size() << ")");
     if (ctx->s == nullptr) {
@@ -5857,6 +5927,9 @@ void ggml_vk_ctx_end(vk_context& ctx) {
         vk_instance.pfn_vkCmdEndDebugUtilsLabelEXT(ctx->s->buffer->buf);
     }
 
+    if (ctx->s->lab_q != UINT32_MAX) {
+        ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, lab_gt_pool, ctx->s->lab_q * 2 + 1);
+    }
     ctx->s->buffer->buf.end();
     ctx->s = nullptr;
 }
@@ -5869,6 +5942,13 @@ void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
 
     subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p) });
     subctx->s = subctx->seqs[subctx->seqs.size() - 1].data();
+
+    lab_gt_setup(device);
+    if (lab_gt_cap && lab_gt_n < lab_gt_cap) {
+        subctx->s->lab_q = lab_gt_n++;
+        subctx->s->buffer->buf.resetQueryPool(lab_gt_pool, subctx->s->lab_q * 2, 2);
+        subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, lab_gt_pool, subctx->s->lab_q * 2);
+    }
 
     if (vk_instance.debug_utils_support) {
         // outermost region, one per command buffer, so the gaps between submits stand out
@@ -14776,6 +14856,13 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph);
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     static const bool lab_t = getenv("ENGINE_LAB_VKT") != nullptr;
+    if (lab_gt_cap && !lab_gt_done) {
+        if (lab_gt_n >= lab_gt_cap) {
+            lab_gt_flush(((ggml_backend_vk_context *) backend->context)->device);
+        } else {
+            lab_gt_graphs.push_back({ lab_gt_n, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count() });
+        }
+    }
     if (!lab_t) return ggml_backend_vk_graph_compute_impl(backend, cgraph);
     static double tot = 0, t_gap = 0, t_gpu = 0; static long n = 0, nodes = 0, n_gpu = 0;
     static std::chrono::steady_clock::time_point last_ret; static bool have_last_ret = false;
@@ -14893,7 +14980,19 @@ static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, gg
         }
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
-    { static const char * lab_fs = getenv("ENGINE_LAB_FLOPS_DIV"); if (lab_fs) { int d = atoi(lab_fs); flops_per_submit = d == 0 ? 0 : std::min(flops_cap, ctx->last_total_flops / (uint64_t)d); } }
+    {
+        const char * lab_df = getenv("ENGINE_LAB_DECODE_FAST");
+        bool lab_dec = false;
+        if (cgraph->n_nodes < 400 && (lab_df ? atoi(lab_df) != 0 : true)) {
+            for (int i = 0; i < cgraph->n_nodes && i < 40; i++) {
+                const ggml_tensor * t = cgraph->nodes[i];
+                if (t->op == GGML_OP_MUL_MAT)    { lab_dec = t->ne[1] == 1; break; }
+                if (t->op == GGML_OP_MUL_MAT_ID) { lab_dec = t->ne[2] == 1; break; }
+            }
+        }
+        if (lab_dec) { flops_per_submit = 0; }
+    }
+    { const char * lab_fs = getenv("ENGINE_LAB_FLOPS_DIV"); if (lab_fs) { int d = atoi(lab_fs); flops_per_submit = d == 0 ? 0 : std::min(flops_cap, ctx->last_total_flops / (uint64_t)d); } }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {

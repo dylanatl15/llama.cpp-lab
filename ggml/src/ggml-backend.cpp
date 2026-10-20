@@ -1891,6 +1891,17 @@ static void ggml_backend_sched_copy_input_impl(ggml_backend_sched_t sched, struc
     }
 }
 
+// lab: single-token decode graph? (first matmul has one column). Used to gate the decode-only fast paths.
+static bool lab_is_decode_graph(const struct ggml_cgraph * g) {
+    if (g->n_nodes >= 400) { return false; }
+    for (int i = 0; i < g->n_nodes && i < 40; i++) {
+        const struct ggml_tensor * t = g->nodes[i];
+        if (t->op == GGML_OP_MUL_MAT)    { return t->ne[1] == 1; }
+        if (t->op == GGML_OP_MUL_MAT_ID) { return t->ne[2] == 1; }
+    }
+    return false;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1904,6 +1915,44 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     auto st_us = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double, std::micro>(b - a).count(); };
     const auto st_enter = st_now();
     if (lab_st && st_have_exit) { st_entry_gap += st_us(st_last_exit, st_enter); }
+
+    // lab: in-process A/B. ENGINE_LAB_ABT=N flips the knobs listed in ENGINE_LAB_ABK (comma list of DEFER, COARSE, ...) every N evaluations
+    // and reports the evaluation period per mode, so both sides see the same thermal / load conditions.
+    {
+        static const int ab_n = getenv("ENGINE_LAB_ABT") ? atoi(getenv("ENGINE_LAB_ABT")) : 0;
+        if (ab_n > 0) {
+            static long ab_call = 0; static int ab_mode = -1;
+            static std::chrono::steady_clock::time_point ab_last; static bool ab_have = false;
+            static std::vector<double> ab_blocks[2]; static double ab_cur = 0; static int ab_cur_n = 0;
+            const char * kn = getenv("ENGINE_LAB_ABK");
+            std::string knobs = kn ? kn : "DEFER";
+            int mode = (int)((ab_call / ab_n) & 1);
+            if (mode != ab_mode) {
+                if (ab_mode >= 0 && ab_cur_n > 0) { ab_blocks[ab_mode].push_back(ab_cur / ab_cur_n); }
+                ab_cur = 0; ab_cur_n = 0; ab_mode = mode;
+                auto setk = [&](const char * name, const char * val) { if (mode) setenv(name, val, 1); else unsetenv(name); };
+                if (knobs.find("DEFER") != std::string::npos)   { setk("ENGINE_LAB_DEFER", "1"); }
+                if (knobs.find("FAST") != std::string::npos)    { if (mode) setenv("ENGINE_LAB_DECODE_FAST", "1", 1); else setenv("ENGINE_LAB_DECODE_FAST", "0", 1); }
+                if (knobs.find("COARSE") != std::string::npos)  { setk("ENGINE_LAB_FLOPS_DIV", "0"); }
+                if (knobs.find("NOPRE") != std::string::npos)   { setk("ENGINE_LAB_AB_NOPRE", "1"); }
+                if (knobs.find("KNOBX") != std::string::npos)   { setk("ENGINE_LAB_AB_X", "1"); }
+                if (knobs.find("KNOBY") != std::string::npos)   { setk("ENGINE_LAB_AB_Y", "1"); }
+            }
+            if (ab_have && (ab_call % ab_n) >= 3) {
+                double per = st_us(ab_last, st_enter) / 1e3;
+                if (per < 250.0) { ab_cur += per; ab_cur_n++; }
+            }
+            ab_last = st_enter; ab_have = true; ab_call++;
+            if (ab_call % (ab_n * 16) == 0) {
+                auto stat = [&](const std::vector<double> & v, double & mean, double & se) {
+                    mean = 0; se = 0; if (v.empty()) return; for (double x : v) mean += x; mean /= v.size();
+                    if (v.size() > 1) { for (double x : v) se += (x-mean)*(x-mean); se = sqrt(se/(v.size()-1)/v.size()); }
+                };
+                double m0, s0, m1, s1; stat(ab_blocks[0], m0, s0); stat(ab_blocks[1], m1, s1);
+                fprintf(stderr, "ABT[%s]: off %.3f ms/tok (+-%.3f, %zu blk) | on %.3f ms/tok (+-%.3f, %zu blk) | on/off %.3f\n", knobs.c_str(), m0, s0, ab_blocks[0].size(), m1, s1, ab_blocks[1].size(), m0 > 0 ? m1/m0 : 0.0);
+            }
+        }
+    }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1925,7 +1974,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // lab: when the copy callback has to wait for the previous split (the MoE cache reads the selected experts back), record this split
         // meanwhile and submit it behind the uploads of the callback
         typedef void (*lab_defer_fn)(ggml_backend_t, int);
-        static const bool lab_defer_on = getenv("ENGINE_LAB_DEFER") != nullptr;
+        const bool lab_defer_on = getenv("ENGINE_LAB_DEFER") != nullptr ||
+            ((getenv("ENGINE_LAB_DECODE_FAST") ? atoi(getenv("ENGINE_LAB_DECODE_FAST")) != 0 : true) && lab_is_decode_graph(&split->graph));
         lab_defer_fn lab_defer = nullptr;
         if (lab_defer_on && sched->callback_copy != NULL && !sched->callback_eval) {
             for (int input_id = 0; input_id < split->n_inputs && !lab_defer; input_id++) {

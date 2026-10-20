@@ -549,6 +549,12 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        if (const char * lp = getenv("ENGINE_LAB_GT_MOE")) {
+            if (FILE * f = fopen(lp, "w")) {
+                for (auto & e : lab_evs) fprintf(f, "M %d %.1f %.1f %.1f %.1f %d\n", e.il, e.t0, e.t1, e.t2, e.t3, e.nmiss);
+                fclose(f);
+            }
+        }
         log_stats();
     }
 
@@ -747,6 +753,9 @@ struct llama_moe_cache::impl {
     double t_read = 0, t_plan = 0, t_up = 0, t_gap = 0, t_memcpy = 0, last_end = 0; size_t n_copy_calls = 0, n_up_calls = 0; size_t d_calls = 0; double d_read = 0, d_up = 0, d_gap = 0, d_memcpy = 0; size_t d_bytes = 0;
     size_t mb_polls = 0, mb_fallbacks = 0;
     static double now_us() { return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+    // lab: per-callback host events, written at exit when ENGINE_LAB_GT_MOE is set (t_enter, t_ids, t_plan, t_end, misses)
+    struct lab_ev { double t0, t1, t2, t3; int il; int nmiss; };
+    std::vector<lab_ev> lab_evs;
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
         const auto it = layer_of.find(src);
@@ -940,6 +949,8 @@ struct llama_moe_cache::impl {
         const double t3 = now_us();
         t_read += t1 - t0; t_plan += t2 - t1; t_up += t3 - t2; n_copy_calls++;
         last_end = t3;
+        if (lab_evs.capacity() < 200000) lab_evs.reserve(200000);
+        if (lab_evs.size() < 200000) lab_evs.push_back({t0, t1, t2, t3, il, (int) fills.size()});
         if (ids.size() <= (size_t) 8*n_expert_used && ids.size() <= (size_t) n_expert_used) { // single-token decode
             d_calls++; d_read += t1 - t0; d_up += t3 - t2; d_gap += gap; d_memcpy += mc; d_bytes += bytes;
         }
