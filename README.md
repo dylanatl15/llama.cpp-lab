@@ -2,7 +2,11 @@
 
 A fork of llama.cpp (branch `lab`) tuned for running a 76 GB mixture-of-experts model
 (Qwen3.8-Flash-Next, IQ3_XXS, 512 experts, 10 active) on a single 16 GB Radeon VII with 64 GB of RAM.
-**About 24 t/s decode, up from about 15 t/s, with bit-identical output.** Vulkan/RADV, AMD only so far.
+**About 27 t/s decode versus 10.5 t/s with stock expert offload on the same card, output identical.**
+
+![decode speed](https://raw.githubusercontent.com/dylanatl15/engine-lab/main/docs/decode-speed.svg)
+
+To run it: build with `-DGGML_VULKAN=ON`, then use [`scripts/bench.sh`](https://github.com/dylanatl15/engine-lab/blob/main/scripts/bench.sh) (`CACHE_MIB=0` gives the stock number). One GPU is enough. Vulkan/RADV, AMD only so far.
 Measurements, dead ends and the harness are in the companion repo:
 [dylanatl15/engine-lab](https://github.com/dylanatl15/engine-lab).
 
