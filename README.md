@@ -6,7 +6,7 @@ A fork of llama.cpp (branch `lab`) tuned for running a 76 GB mixture-of-experts 
 
 ![decode speed](https://raw.githubusercontent.com/dylanatl15/engine-lab/main/docs/decode-speed.svg)
 
-To run it: build with `-DGGML_VULKAN=ON`, then use [`scripts/bench.sh`](https://github.com/dylanatl15/engine-lab/blob/main/scripts/bench.sh) (`CACHE_MIB=0` gives the stock number). One GPU is enough. Vulkan/RADV, AMD only so far.
+To run it: build with `-DGGML_VULKAN=ON`, (needs `libvulkan-dev spirv-headers glslc` on Debian/Ubuntu), then use [`scripts/bench.sh`](https://github.com/dylanatl15/engine-lab/blob/main/scripts/bench.sh) (`CACHE_MIB=0` gives the stock number). One GPU is enough. Vulkan/RADV, AMD only so far.
 Measurements, dead ends and the harness are in the companion repo:
 [dylanatl15/engine-lab](https://github.com/dylanatl15/engine-lab).
 
