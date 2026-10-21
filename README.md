@@ -1,3 +1,35 @@
+# llama.cpp-lab: big MoE models on one consumer GPU
+
+A fork of llama.cpp (branch `lab`) tuned for running a 76 GB mixture-of-experts model
+(Qwen3.8-Flash-Next, IQ3_XXS, 512 experts, 10 active) on a single 16 GB Radeon VII with 64 GB of RAM.
+**About 24 t/s decode, up from about 15 t/s, with bit-identical output.** Vulkan/RADV, AMD only so far.
+Measurements, dead ends and the harness are in the companion repo:
+[dylanatl15/engine-lab](https://github.com/dylanatl15/engine-lab).
+
+## What is different from upstream
+
+| Change | Effect |
+|---|---|
+| Expert-cache upload path: memcpy worker pool, mailbox written by the GPU instead of a readback and sync | upload per layer 350 -> 65 us, about +20% decode |
+| Fused `GGML_OP_HC_MIX` and `GGML_OP_MOE_COMBINE` Vulkan ops | fewer graph nodes and dispatches per layer |
+| Grid-style quantized matvec kernel (MMVQ) | faster matvec on Radeon VII |
+| Deferred recording plus coarse submits, decode graphs only | about 3-4%, off for prefill (`ENGINE_LAB_DECODE_FAST=0` opts out) |
+| In-process A/B harness (`ENGINE_LAB_ABT`, `ENGINE_LAB_ABK`) | resolves 3% effects despite +-8% run-to-run noise |
+| Timeline instrumentation (`ENGINE_LAB_GT*`), predictor recall probe (`LAB_PRED`) | analysis only |
+
+## Why you might care
+
+Decode is bounded by about 72 expert cache misses per token (about 119 MiB over PCIe 3.0) and about
+100 us of host round trip per layer, not by FLOPs. The engine-lab README documents what moved those
+numbers, what did not (clock pinning, zero-copy import, transfer queues, speculation, prefetch), and why.
+
+## Status
+
+Single GPU, one model family, one machine. Not upstream-quality: the changes are research patches.
+Next: a second card with a pooled expert cache. Issues and numbers from other hardware are welcome.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
